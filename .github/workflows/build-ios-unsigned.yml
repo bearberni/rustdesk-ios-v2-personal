@@ -1,0 +1,45 @@
+name: Build RustDesk V2 unsigned iOS
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustdesk-ios-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 240
+    defaults:
+      run:
+        shell: bash
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      FLUTTER_SUPPRESS_ANALYTICS: 'true'
+      DART_SUPPRESS_ANALYTICS: 'true'
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Get build recipes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Validate repository recipes
+        run: python3 scripts/static_check.py --workflow-optional-parser
+
+      - name: Build unsigned device archive and IPA
+        run: bash scripts/build-ios.sh
+
+      - name: Upload unsigned IPA, source, and provenance
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RustDesk-V2-unsigned-${{ github.run_number }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
