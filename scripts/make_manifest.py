@@ -29,8 +29,8 @@ def main():
     args = parser.parse_args()
     lock = json.loads((args.recipe / "build-lock.json").read_text(encoding="utf-8"))
     source = args.source
-    files = {p.name: {"sha256": digest(p), "bytes": p.stat().st_size}
-             for p in sorted(args.dist.iterdir())
+    files = {p.relative_to(args.dist).as_posix(): {"sha256": digest(p), "bytes": p.stat().st_size}
+             for p in sorted(args.dist.rglob("*"))
              if p.is_file() and p.name not in {"build.log", "manifest.json", "SHA256SUMS"}}
     # build.log is actively written by tee; do not record a hash before it is closed.
     core = source / "target/aarch64-apple-ios/release/liblibrustdesk.a"
