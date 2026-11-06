@@ -60,6 +60,7 @@ check_runtime_pods() {
 require 'json'
 require 'digest'
 require 'fileutils'
+require 'open3'
 require 'yaml'
 source, preparation_path, output, pod_version = ARGV
 gem 'cocoapods', pod_version
@@ -84,7 +85,6 @@ report = {
 }
 preparation.fetch('podspec_checksum_updates').each do |name, checksums|
   package = pub_lock.fetch('packages').fetch(name)
-  abort "Unexpected non-hosted package #{name}" unless package.fetch('source') == 'hosted'
   external = pod_lock.fetch('EXTERNAL SOURCES').fetch(name)
   relative = external[':path'] || external[:path]
   abort "Missing local pod path #{name}" unless relative.is_a?(String)
@@ -95,6 +95,26 @@ preparation.fetch('podspec_checksum_updates').each do |name, checksums|
   abort "Missing iOS plugin #{name}" unless plugin
   # pub get generates this official dependency file before podhelper creates symlinks.
   package_path = plugin.fetch('path')
+  description = package.fetch('description')
+  case package.fetch('source')
+  when 'hosted'
+    provenance = {
+      'kind' => 'hosted', 'url' => description.fetch('url'),
+      'archive_sha256_from_enforced_lock' => description.fetch('sha256')
+    }
+  when 'git'
+    expected_ref = 'f416118d843a7e9ed117c7bb7bdc2deda5a9e86f'
+    expected_url = 'https://github.com/rustdesk-org/uni_links'
+    abort "Unexpected Git dependency #{name}" unless name == 'uni_links' && description.fetch('url') == expected_url && description.fetch('path') == 'uni_links' && description.fetch('ref') == expected_ref && description.fetch('resolved-ref') == expected_ref
+    head, status = Open3.capture2e('git', '-C', package_path, 'rev-parse', 'HEAD')
+    abort "Git plugin HEAD mismatch #{name}: #{head.strip}" unless status.success? && head.strip == expected_ref
+    provenance = {
+      'kind' => 'git', 'url' => expected_url, 'resolved_ref' => expected_ref,
+      'checked_out_commit' => head.strip, 'package_subdirectory' => description.fetch('path')
+    }
+  else
+    abort "Unexpected package source #{name}"
+  end
   plugin_pubspec = YAML.safe_load(File.read(File.join(package_path, 'pubspec.yaml')), aliases: false)
   abort "Plugin source version differs #{name}" unless plugin_pubspec.fetch('version').to_s == package.fetch('version').to_s
   path = File.join(package_path, platform_dir, "#{name}.podspec")
@@ -105,8 +125,7 @@ preparation.fetch('podspec_checksum_updates').each do |name, checksums|
   abort "Podspec checksum mismatch #{name}: expected #{checksums.fetch('new')}, actual #{actual}" unless actual == checksums.fetch('new')
   report['packages'][name] = {
     'dart_version' => package.fetch('version'),
-    'archive_sha256_from_enforced_lock' => package.fetch('description').fetch('sha256'),
-    'package_source' => package.fetch('description').fetch('url'),
+    'package_provenance' => provenance,
     'relative_pod_path' => relative,
     'raw_podspec_sha256' => Digest::SHA256.file(path).hexdigest,
     'normalized_podspec_sha1' => actual,
