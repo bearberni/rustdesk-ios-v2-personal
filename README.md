@@ -62,6 +62,8 @@ do not copy the App Store app's config/token directory. A changed device ID is n
 The build freshly fetches and verifies fixed commits; generates the FFI bridge; builds
 the Rust static library; builds the Flutter device archive; then packages and verifies an IPA.
 It does not reuse a prebuilt Rust core or a cached generated bridge.
+Both Flutter release tags are fetched and checked against their fixed commits, and
+the SDK's own reported version/revision is verified before native dependency builds.
 
 Flutter 3.24.5's `flutter build ipa --no-codesign` skips IPA export. This recipe explicitly
 packages the archived application as `Payload/<app>.app` inside `RustDesk-V2-unsigned.ipa`.
