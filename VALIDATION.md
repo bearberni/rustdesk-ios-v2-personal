@@ -36,3 +36,19 @@ The recipe now puts a local `pod` shim first in PATH and uses RubyGems' explicit
 `_1.15.2_` version selector for direct commands and Flutter subprocesses. It also prints
 the selected version before checking it. Shell syntax and forwarding behavior were
 checked locally; a second CI run is needed to validate the actual RubyGems execution.
+That RubyGems execution was subsequently confirmed in the second run below.
+
+## Second CI run and Flutter release metadata fix
+
+Run `42171938809`, commit `b7d38b83b8418c3d1dedd0f3bbf3e9c649564e29`, verified
+`Selected CocoaPods: 1.15.2`, completed all 17 vcpkg installations, and compiled/installed
+both bridge-generation tools with the pinned Rust toolchain. It reached the bridge
+Flutter dependency resolver and stopped because that SDK reported `0.0.0-unknown`.
+The SHA-only shallow fetch had omitted Flutter's release tag; Flutter uses local tags
+to determine its version, so sqflite's Flutter minimum was rejected before FFI generation.
+
+The recipe now fetches each exact Flutter release tag, verifies its target equals the
+already pinned commit, and verifies `flutter --version --machine` for both version and
+revision before the expensive vcpkg build. Both SDKs are fixed; this does not upgrade
+Flutter or fabricate a version file. Local syntax/fixture checks pass; a subsequent
+macOS run must confirm the SDK metadata and continue the actual application build.
