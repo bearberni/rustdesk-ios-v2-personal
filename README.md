@@ -23,13 +23,17 @@ The target iOS deployment minimum is 15.0. The workflow selects **macos-15-intel
 **Xcode 16.4, build 16F6**, confirmed present in the reviewed official runner inventory.
 It fails if that exact Xcode is unavailable instead of silently using a newer one.
 Upstream generates the bridge on Linux. This single-job recipe generates it on macOS
-with the same pinned bridge tools. That host adaptation has not yet been compiled and
-is one item for the first macOS run to validate. The separate upstream macOS-desktop
+with the same pinned bridge tools. Run 42179000648 completed that bridge generation;
+the iOS application build remains unvalidated. The separate upstream macOS-desktop
 Rust 1.81 setting is not treated as an iOS or bridge minimum.
 
 Hosted image updates, Homebrew packages, Ruby transitive gems, and temporary bridge
 dependency resolution remain moving inputs. The latter is retained as `bridge-pubspec.lock`.
-Runtime Cargo/Dart/Pod locks are retained and enforced. The manifest records actual
+Runtime Cargo/Dart locks and native pod versions are retained and enforced. Twelve local
+podspec checksum entries are explicitly calibrated to the pinned plugin inputs observed
+in run 42179000648; the audit independently regenerates their JSON and checks those exact
+values with CocoaPods 1.15.2. All other Podfile.lock bytes remain unchanged and deployment
+mode remains mandatory. The manifest records actual
 tool versions, image version, submodules, lockfile hashes, and artifact hashes.
 This is a pinned starting point, not a promise of byte-identical output or compatibility
 between old Flutter and every new Xcode. First compilation may expose upstream toolchain issues;
@@ -46,6 +50,8 @@ Only the prepared copy of upstream source is changed:
 - APNs and Wi-Fi-info entitlements are removed. The inspected controller implementation
   does not register APNs or query Wi-Fi SSID information. No App Group or Keychain Access
   Group is introduced. Actual signing/device validation is still required.
+- Twelve local plugin podspec checksums are calibrated as described above; no native pod
+  versions or Dart package versions are updated.
 
 Server settings, keys, passwords, and tokens are never embedded. The personal app has its
 own configuration storage. Configure it manually and create a new V2 trust grant;
@@ -64,6 +70,13 @@ the Rust static library; builds the Flutter device archive; then packages and ve
 It does not reuse a prebuilt Rust core or a cached generated bridge.
 Both Flutter release tags are fetched and checked against their fixed commits, and
 the SDK's own reported version/revision is verified before native dependency builds.
+Runtime Dart and CocoaPods preparation is checked before vcpkg, then repeated after the
+bridge's temporary dependency state is restored. The local-spec audit reads package paths
+from Flutter's generated dependency metadata; it does not require podhelper symlinks to
+exist early. It records locked package versions, hosted archive hashes or Git provenance, source podspec hashes,
+normalized JSON/checksums, and Ruby/JSON/CocoaPods environment versions.
+The only permitted Git plugin is the upstream-pinned `uni_links`; its URL, package
+subdirectory, ref/resolved-ref, and actual local Git HEAD are checked explicitly.
 
 Flutter 3.24.5's `flutter build ipa --no-codesign` skips IPA export. This recipe explicitly
 packages the archived application as `Payload/<app>.app` inside `RustDesk-V2-unsigned.ipa`.
@@ -75,7 +88,11 @@ Output includes:
 - `verification.json` with ZIP identity, iOS-device/arm64, unsigned-main-app, and linked-V2-marker checks;
 - `manifest.json` and `SHA256SUMS` with source/tool/artifact provenance;
 - `source-preparation.json`, bridge resolver lock, upstream license, and corresponding modified source;
+- both local-podspec audit directories, included in the manifest's recursive file hashes;
 - public build log. No signing credentials or personal server configuration are requested.
+
+Failed builds preserve a separately named diagnostics artifact for three days. A diagnostics
+artifact is not evidence of an installable or accepted IPA.
 
 Signing needs an Apple account and provisioning compatible with the chosen installation
 method. The workflow deliberately does not request these credentials. Free Personal Team
