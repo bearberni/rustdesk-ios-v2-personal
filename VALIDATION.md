@@ -18,7 +18,21 @@ Completed locally on Windows; these results do not establish a working iOS appli
 - Separately, the public source's V2 commit ancestry and the pinned `hbb_common` SHA were
   verified against the existing upstream object database.
 
-Not run: macOS dependency installation, FFI generation, Rust iOS compilation, Flutter archive,
-real IPA validation, signing, installation, or real-iPhone V2 acceptance.
+Still not run: FFI generation, Rust iOS compilation, Flutter archive, real IPA validation,
+signing, installation, or real-iPhone V2 acceptance.
 The first CI run must establish those build results. Its success must not be inferred
 from local static/fixture checks. Signing and iPhone acceptance remain later steps.
+
+## First CI run and CocoaPods selection fix
+
+Run `42170454959`, commit `86eb87c2636867027a2980ded75bc8089388df8e`, passed checkout and
+recipe checks, prepared the pinned source/identity, fetched both Flutter SDKs and Rust,
+installed assembler/CMake dependencies, and installed CocoaPods 1.15.2.
+It stopped at the CocoaPods version guard before the Rust/iOS application build.
+The old guard did not print the selected value; RubyGems' unversioned launcher can select
+the runner's newer installed gem through GEM_PATH despite the new bin directory's PATH priority.
+
+The recipe now puts a local `pod` shim first in PATH and uses RubyGems' explicit
+`_1.15.2_` version selector for direct commands and Flutter subprocesses. It also prints
+the selected version before checking it. Shell syntax and forwarding behavior were
+checked locally; a second CI run is needed to validate the actual RubyGems execution.
