@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,12 +50,22 @@ def check(root, optional_parser=False):
     assert "\r" not in script, "Shell script must use LF line endings"
     assert "--no-codesign" in script and "--locked" in script
     assert "--enforce-lockfile" in script and "pod install --deployment" in script
+    embedded_python = re.findall(r"<<'PY'\n(.*?)\nPY", script, re.DOTALL)
+    for block in embedded_python:
+        ast.parse(block)
+    embedded_ruby = re.findall(r"<<'RUBY'\n(.*?)\nRUBY", script, re.DOTALL)
+    ruby_syntax = "not available on this host; checked by the macOS CI static step"
+    if shutil.which("ruby"):
+        for block in embedded_ruby:
+            subprocess.run(["ruby", "-c"], input=block, text=True, check=True)
+        ruby_syntax = "passed"
     assert "git -C \"$destination\" -c advice.detachedHead=false " + "".join(map(chr, (99, 104, 101, 99, 107, 111, 117, 116))) + " --detach" in script
     for file in root.rglob("*"):
         if file.is_file() and not any(part in {".git", ".build", "dist", "__pycache__"} for part in file.relative_to(root).parts):
             assert file.suffix.lower() not in {".p12", ".p8", ".mobileprovision", ".ipa"}, "Signing material must not be committed"
     return {"json_lock": "passed", "python_ast_files": len(pyfiles), "workflow": parser_status,
             "manual_dispatch_only": True, "action_names_and_sha_guards": "passed",
+            "embedded_python_blocks": len(embedded_python), "embedded_ruby_syntax": ruby_syntax,
             "macos_compile": "not run", "signing": "not run", "iphone_acceptance": "not run"}
 
 
