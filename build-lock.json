@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "https://github.com/rustdesk/rustdesk.git",
+    "commit": "23e5bb471a040d62f0a6ad52591fb30784265b73",
+    "tag_for_reference": "1.5.1",
+    "trusted_device_v2_commit": "350966b331bb873650668549b3fa4a42e81e6a81",
+    "hbb_common_commit": "fae47e024dd83cef6aaecde0aa7d11731df11649"
+  },
+  "identity": {
+    "bundle_id": "com.bearberni.rustdesk.v2",
+    "display_name": "RustDesk V2",
+    "version": "1.5.1"
+  },
+  "tools": {
+    "runner": "macos-15-intel",
+    "xcode": "16.4",
+    "xcode_build": "16F6",
+    "xcode_directory": "/Applications/Xcode_16.4.app/Contents/Developer",
+    "rust": "1.75.0",
+    "flutter": {
+      "version": "3.24.5",
+      "commit": "dec2ee5c1f98f8e84a7d5380c05eb8a3d0a81668"
+    },
+    "bridge_flutter": {
+      "version": "3.22.3",
+      "commit": "b0850beeb25f6d5b10426284f506557f66181b36"
+    },
+    "cargo_expand": "1.0.95",
+    "bridge_codegen": "1.80.1",
+    "vcpkg_commit": "9e593bb18ea69cc5095e012465dcd675a822ed0d",
+    "vcpkg_triplet": "arm64-ios",
+    "cmake": "4.3.0",
+    "cocoapods": "1.15.2"
+  },
+  "verification_sources": {
+    "upstream_workflow": "https://github.com/rustdesk/rustdesk/blob/23e5bb471a040d62f0a6ad52591fb30784265b73/.github/workflows/flutter-build.yml",
+    "upstream_bridge": "https://github.com/rustdesk/rustdesk/blob/23e5bb471a040d62f0a6ad52591fb30784265b73/.github/workflows/bridge.yml",
+    "runner_image_review_commit": "42d27e4a2c1232e5640a88ed42a974c8918ecd28",
+    "runner_image": "https://github.com/actions/runner-images/blob/42d27e4a2c1232e5640a88ed42a974c8918ecd28/images/macos/macos-15-Readme.md"
+  }
+}
