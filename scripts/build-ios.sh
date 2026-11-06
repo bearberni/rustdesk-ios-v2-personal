@@ -48,6 +48,79 @@ if result.get("frameworkVersion") != sys.argv[2] or result.get("frameworkRevisio
 print(f"Verified Flutter SDK: {result['frameworkVersion']} {result['frameworkRevision']}")
 PY
 }
+check_runtime_pods() {
+  local stage="$1"
+  (
+    cd "$SOURCE/flutter"
+    flutter pub get --enforce-lockfile
+  )
+  # Reproduce local-spec JSON with the fixed CocoaPods version, rather than
+  # accepting arbitrary checksums or upgrading native pod versions.
+  ruby - "$SOURCE" "$DIST/source-preparation.json" "$DIST/podspec-audit-$stage" "$(value tools.cocoapods)" <<'RUBY'
+require 'json'
+require 'digest'
+require 'fileutils'
+require 'yaml'
+source, preparation_path, output, pod_version = ARGV
+gem 'cocoapods', pod_version
+require 'cocoapods'
+preparation = JSON.parse(File.read(preparation_path))
+pub_path = File.join(source, 'flutter/pubspec.lock')
+pod_path = File.join(source, 'flutter/ios/Podfile.lock')
+abort 'Runtime pubspec.lock bytes changed' unless Digest::SHA256.file(pub_path).hexdigest == preparation.fetch('runtime_pubspec_lock_sha256')
+abort 'Prepared Podfile.lock bytes changed' unless Digest::SHA256.file(pod_path).hexdigest == preparation.fetch('after_sha256').fetch('flutter/ios/Podfile.lock')
+pub_lock = YAML.safe_load(File.read(pub_path), aliases: false)
+pod_lock = YAML.safe_load(File.read(pod_path), permitted_classes: [Symbol], aliases: false)
+plugins_path = File.join(source, 'flutter/.flutter-plugins-dependencies')
+ios_plugins = JSON.parse(File.read(plugins_path)).fetch('plugins').fetch('ios')
+FileUtils.mkdir_p(output)
+report = {
+  'ruby' => RUBY_VERSION, 'json' => JSON::VERSION,
+  'cocoapods' => Pod::VERSION,
+  'cocoapods_core' => Gem.loaded_specs.fetch('cocoapods-core').version.to_s,
+  'xcodeproj' => Gem.loaded_specs.fetch('xcodeproj').version.to_s,
+  'runtime_pubspec_lock_sha256' => Digest::SHA256.file(pub_path).hexdigest,
+  'packages' => {}
+}
+preparation.fetch('podspec_checksum_updates').each do |name, checksums|
+  package = pub_lock.fetch('packages').fetch(name)
+  abort "Unexpected non-hosted package #{name}" unless package.fetch('source') == 'hosted'
+  external = pod_lock.fetch('EXTERNAL SOURCES').fetch(name)
+  relative = external[':path'] || external[:path]
+  abort "Missing local pod path #{name}" unless relative.is_a?(String)
+  abort "Unexpected local pod path #{name}" unless relative.start_with?(".symlinks/plugins/#{name}/")
+  platform_dir = relative.split('/').last
+  abort "Unexpected pod platform #{name}" unless ['ios', 'darwin'].include?(platform_dir)
+  plugin = ios_plugins.find { |entry| entry.fetch('name') == name }
+  abort "Missing iOS plugin #{name}" unless plugin
+  # pub get generates this official dependency file before podhelper creates symlinks.
+  package_path = plugin.fetch('path')
+  plugin_pubspec = YAML.safe_load(File.read(File.join(package_path, 'pubspec.yaml')), aliases: false)
+  abort "Plugin source version differs #{name}" unless plugin_pubspec.fetch('version').to_s == package.fetch('version').to_s
+  path = File.join(package_path, platform_dir, "#{name}.podspec")
+  spec = Pod::Specification.from_file(path)
+  normalized = spec.to_pretty_json
+  actual = Digest::SHA1.hexdigest(normalized)
+  File.binwrite(File.join(output, "#{name}.podspec.json"), normalized)
+  abort "Podspec checksum mismatch #{name}: expected #{checksums.fetch('new')}, actual #{actual}" unless actual == checksums.fetch('new')
+  report['packages'][name] = {
+    'dart_version' => package.fetch('version'),
+    'archive_sha256_from_enforced_lock' => package.fetch('description').fetch('sha256'),
+    'package_source' => package.fetch('description').fetch('url'),
+    'relative_pod_path' => relative,
+    'raw_podspec_sha256' => Digest::SHA256.file(path).hexdigest,
+    'normalized_podspec_sha1' => actual,
+    'native_spec_version' => spec.version.to_s
+  }
+  puts "Verified locked local podspec: #{name} #{package.fetch('version')} #{actual}"
+end
+File.write(File.join(output, 'report.json'), JSON.pretty_generate(report) + "\n")
+RUBY
+  (
+    cd "$SOURCE/flutter/ios"
+    pod install --deployment
+  )
+}
 
 [[ "$(uname -s)" == Darwin ]] || fail "This build requires macOS; Windows static checks do not compile iOS."
 [[ "$(uname -m)" == x86_64 ]] || fail "This recipe was prepared for the pinned Intel runner."
@@ -107,6 +180,10 @@ SELECTED_POD_VERSION="$(pod --version)"
 printf 'Selected CocoaPods: %s\n' "$SELECTED_POD_VERSION"
 [[ "$SELECTED_POD_VERSION" == "$(value tools.cocoapods)" ]] || fail "Unexpected CocoaPods version"
 
+# pub get generates the missing iOS configuration without compiling Dart/FFI.
+# Check local pod metadata before the expensive native dependency build.
+check_runtime_pods preflight
+
 export VCPKG_ROOT="$TOOLS/vcpkg"
 clone_commit https://github.com/microsoft/vcpkg.git "$(value tools.vcpkg_commit)" "$VCPKG_ROOT"
 "$VCPKG_ROOT/bootstrap-vcpkg.sh" -disableMetrics
@@ -144,12 +221,7 @@ PY
 )
 cp "$BUILD_ROOT/runtime-pubspec.yaml" "$SOURCE/flutter/pubspec.yaml"
 cp "$BUILD_ROOT/runtime-pubspec.lock" "$SOURCE/flutter/pubspec.lock"
-(
-  cd "$SOURCE/flutter"
-  flutter pub get --enforce-lockfile
-  cd ios
-  pod install --deployment
-)
+check_runtime_pods post-bridge
 
 (
   cd "$SOURCE"
