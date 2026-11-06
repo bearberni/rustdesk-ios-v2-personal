@@ -67,7 +67,21 @@ export GEM_HOME="$TOOLS/gems"
 export GEM_PATH="$GEM_HOME:$(ruby -e 'puts Gem.default_path.join(":")')"
 export PATH="$GEM_HOME/bin:$PATH"
 gem install cocoapods --version "$(value tools.cocoapods)" --no-document --install-dir "$GEM_HOME"
-[[ "$(pod --version)" == "$(value tools.cocoapods)" ]] || fail "Unexpected CocoaPods version"
+# A RubyGems launcher can select a newer preinstalled gem from GEM_PATH even
+# when this GEM_HOME/bin directory is first in PATH. Force the version for
+# both our commands and Flutter's subprocesses with the supported selector.
+mkdir -p "$TOOLS/pinned-bin"
+cat > "$TOOLS/pinned-bin/pod" <<POD
+#!/usr/bin/env bash
+set -euo pipefail
+exec "$GEM_HOME/bin/pod" "_$(value tools.cocoapods)_" "\$@"
+POD
+chmod +x "$TOOLS/pinned-bin/pod"
+export PATH="$TOOLS/pinned-bin:$PATH"
+hash -r
+SELECTED_POD_VERSION="$(pod --version)"
+printf 'Selected CocoaPods: %s\n' "$SELECTED_POD_VERSION"
+[[ "$SELECTED_POD_VERSION" == "$(value tools.cocoapods)" ]] || fail "Unexpected CocoaPods version"
 
 export VCPKG_ROOT="$TOOLS/vcpkg"
 clone_commit https://github.com/microsoft/vcpkg.git "$(value tools.vcpkg_commit)" "$VCPKG_ROOT"
