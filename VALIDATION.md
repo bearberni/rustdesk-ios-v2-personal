@@ -124,3 +124,28 @@ hash or claim of retaining those generated files is made. Any separately prepare
 package must distinguish the fixed source/recipes/reconstruction inputs from files actually
 retained by this run. At artifact recovery, normal signing, iOS launch, and V2
 enrollment/reconnect acceptance had not run; subsequent acceptance is recorded separately.
+
+## Fifth CI run: complete workflow and downloaded artifacts
+
+[Run 42198548001](https://github.com/bearberni/rustdesk-ios-v2-personal/actions/runs/42198548001),
+recipe commit `ea5253f99de5223bc24e726bc20d806d29a62bb1`, completed every build,
+verification, corresponding-source, manifest, and upload step successfully. Artifact
+`RustDesk-V2-unsigned-5` has 35,308,677 ZIP bytes and SHA256
+`1df1362243820efbdc7e9ddd223b2c5e6f98499fa36e1c246a341d997d470a88`.
+
+Independent checks of the downloaded bytes matched all 34 manifest file hashes/sizes and
+all 35 SHA256SUMS entries. Local verification of the actual IPA exactly matched the CI
+report for the main executable and all 20 frameworks. Build 5 has version 1.5.1, deployment
+minimum 15.0, 27,105,033 IPA bytes, and SHA256
+`39e82dec3d9d514c979a4d5bbd85ede6646562a1989f29610b4fa688c0260dcd`.
+
+The corresponding-source tar contains 1,432 members, including the six actual generated
+FFI files from this runner. Cargo/Dart locks match the pinned Git bytes. The prepared Pod
+lock and modified source match the CI preparation/audit reports; both generated C headers
+are identical. The producer records the native library hash, but its .a is not retained in
+the artifact and was not independently rehashed after download.
+
+Build 5 has not been signed, installed, or accepted on an iPhone. These are complete CI
+and downloaded-artifact results. Device acceptance for a different binary does not transfer.
+Later documentation-only commits describe this run; the validated producer remains the
+recipe commit named above.
