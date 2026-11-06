@@ -3,13 +3,13 @@
 Build recipes for an independent **RustDesk V2** iPhone app. The App Store RustDesk app
 can remain installed. This is a personal build, not an upstream release.
 
-**Current validation:** run 42188989343 successfully compiled the iOS Rust core and Xcode
-archive. It then failed because the original verifier incorrectly required every framework
-to be thin. The unchanged unsigned IPA was recovered from diagnostics and passed the
-corrected local verifier, including all 21 arm64 iOS-device binaries. The CI run remains
-failed and stopped before source/manifest production. At artifact recovery, signing and
-real-iPhone acceptance had not run; subsequent device acceptance is recorded separately.
-See VALIDATION.md for the evidence and limits.
+**Current validation:** [run 42198548001](https://github.com/bearberni/rustdesk-ios-v2-personal/actions/runs/42198548001),
+recipe commit `ea5253f99de5223bc24e726bc20d806d29a62bb1`, completed the full native build,
+Xcode archive, IPA verification, corresponding-source package, manifest, and artifact upload.
+The downloaded ZIP digest, all manifest hashes/sizes, all SHA256SUMS entries, generated
+FFI files, and actual IPA were independently rechecked. Build 5 has not been signed or
+installed; real-device results for any earlier binary are recorded separately and do not
+transfer automatically. See VALIDATION.md for the evidence and limits.
 
 ## Fixed source and tools
 
@@ -27,8 +27,7 @@ The target iOS deployment minimum is 15.0. The workflow selects **macos-15-intel
 **Xcode 16.4, build 16F6**, confirmed present in the reviewed official runner inventory.
 It fails if that exact Xcode is unavailable instead of silently using a newer one.
 Upstream generates the bridge on Linux. This single-job recipe generates it on macOS
-with the same pinned bridge tools. Run 42179000648 completed that bridge generation;
-the iOS application build remains unvalidated. The separate upstream macOS-desktop
+with the same pinned bridge tools. Run 42198548001 completed that bridge generation and the full iOS application build. The separate upstream macOS-desktop
 Rust 1.81 setting is not treated as an iOS or bridge minimum.
 
 Hosted image updates, Homebrew packages, Ruby transitive gems, and temporary bridge
