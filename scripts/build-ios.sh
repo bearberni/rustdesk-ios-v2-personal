@@ -28,6 +28,26 @@ clone_commit() {
   git -C "$destination" -c advice.detachedHead=false checkout --detach FETCH_HEAD
   [[ "$(git -C "$destination" rev-parse HEAD)" == "$commit" ]] || fail "Commit mismatch"
 }
+fetch_flutter_release_tag() {
+  local sdk="$1" version="$2" commit="$3"
+  # Flutter determines its SDK version from local release tags. A SHA-only
+  # shallow fetch otherwise leaves the framework at 0.0.0-unknown.
+  git -C "$sdk" fetch --depth=1 origin "refs/tags/$version:refs/tags/$version"
+  [[ "$(git -C "$sdk" rev-parse "refs/tags/$version^{commit}")" == "$commit" ]] || fail "Flutter release tag no longer matches the pinned commit"
+}
+verify_flutter_version() {
+  local sdk="$1" version="$2" commit="$3" report="$4"
+  "$sdk/bin/flutter" --disable-analytics
+  "$sdk/bin/flutter" --version --machine > "$report"
+  python3 - "$report" "$version" "$commit" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as stream:
+    result = json.load(stream)
+if result.get("frameworkVersion") != sys.argv[2] or result.get("frameworkRevision") != sys.argv[3]:
+    raise SystemExit(f"Unexpected Flutter identity: {result.get('frameworkVersion')} {result.get('frameworkRevision')}")
+print(f"Verified Flutter SDK: {result['frameworkVersion']} {result['frameworkRevision']}")
+PY
+}
 
 [[ "$(uname -s)" == Darwin ]] || fail "This build requires macOS; Windows static checks do not compile iOS."
 [[ "$(uname -m)" == x86_64 ]] || fail "This recipe was prepared for the pinned Intel runner."
@@ -48,9 +68,13 @@ python3 "$RECIPE_ROOT/scripts/prepare_source.py" --source "$SOURCE" --lock "$LOC
 
 clone_commit https://github.com/flutter/flutter.git "$(value tools.flutter.commit)" "$TOOLS/flutter"
 clone_commit https://github.com/flutter/flutter.git "$(value tools.bridge_flutter.commit)" "$TOOLS/flutter-bridge"
+fetch_flutter_release_tag "$TOOLS/flutter" "$(value tools.flutter.version)" "$(value tools.flutter.commit)"
+fetch_flutter_release_tag "$TOOLS/flutter-bridge" "$(value tools.bridge_flutter.version)" "$(value tools.bridge_flutter.commit)"
 # Match the upstream patch used for the pinned 3.24.5 SDK.
 git -C "$TOOLS/flutter" apply --check "$SOURCE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
 git -C "$TOOLS/flutter" apply "$SOURCE/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff"
+verify_flutter_version "$TOOLS/flutter" "$(value tools.flutter.version)" "$(value tools.flutter.commit)" "$DIST/flutter-main-sdk.json"
+verify_flutter_version "$TOOLS/flutter-bridge" "$(value tools.bridge_flutter.version)" "$(value tools.bridge_flutter.commit)" "$DIST/flutter-bridge-sdk.json"
 
 export RUSTUP_TOOLCHAIN="$(value tools.rust)"
 rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --target aarch64-apple-ios
