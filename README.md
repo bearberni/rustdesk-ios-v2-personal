@@ -3,9 +3,13 @@
 Build recipes for an independent **RustDesk V2** iPhone app. The App Store RustDesk app
 can remain installed. This is a personal build, not an upstream release.
 
-**Current validation:** Python/YAML/shell static validation can run on Windows.
-No macOS compile, signing, installation, or real-iPhone trust acceptance has been completed
-as part of preparing these recipes. A passing fixture test is not an iOS build result.
+**Current validation:** run 42188989343 successfully compiled the iOS Rust core and Xcode
+archive. It then failed because the original verifier incorrectly required every framework
+to be thin. The unchanged unsigned IPA was recovered from diagnostics and passed the
+corrected local verifier, including all 21 arm64 iOS-device binaries. The CI run remains
+failed and stopped before source/manifest production. At artifact recovery, signing and
+real-iPhone acceptance had not run; subsequent device acceptance is recorded separately.
+See VALIDATION.md for the evidence and limits.
 
 ## Fixed source and tools
 
@@ -36,7 +40,7 @@ values with CocoaPods 1.15.2. All other Podfile.lock bytes remain unchanged and 
 mode remains mandatory. The manifest records actual
 tool versions, image version, submodules, lockfile hashes, and artifact hashes.
 This is a pinned starting point, not a promise of byte-identical output or compatibility
-between old Flutter and every new Xcode. First compilation may expose upstream toolchain issues;
+between old Flutter and every new Xcode. Further CI or platform runs may expose toolchain issues;
 any necessary change should be reviewed and recorded rather than silently upgrading everything.
 
 ## Personal application changes
@@ -82,7 +86,7 @@ Flutter 3.24.5's `flutter build ipa --no-codesign` skips IPA export. This recipe
 packages the archived application as `Payload/<app>.app` inside `RustDesk-V2-unsigned.ipa`.
 The ZIP packaging does **not** sign the app or make it installable by itself.
 
-Output includes:
+A fully completed workflow produces:
 
 - `RustDesk-V2-unsigned.ipa`, requiring a separate normal signing/install process;
 - `verification.json` with ZIP identity, iOS-device/arm64, unsigned-main-app, and linked-V2-marker checks;
