@@ -52,3 +52,34 @@ already pinned commit, and verifies `flutter --version --machine` for both versi
 revision before the expensive vcpkg build. Both SDKs are fixed; this does not upgrade
 Flutter or fabricate a version file. Local syntax/fixture checks pass; a subsequent
 macOS run must confirm the SDK metadata and continue the actual application build.
+
+## Third CI run and locked local-podspec calibration
+
+Run `42179000648`, commit `506c3141eec0d8feee44adaf13b14c4e0fd4b6c8`, passed both
+Flutter SDK identity guards, vcpkg, FFI generation/header copy, and runtime
+`flutter pub get --enforce-lockfile`. It stopped at `pod install --deployment` because
+12 local Flutter plugin SPEC CHECKSUMS differed. The reported diff contained no pod
+version or dependency changes. No Rust iOS application compilation or IPA occurred.
+
+The original Podfile.lock and runtime pubspec.lock were both last changed upstream in
+`ef827fdb34aef13cb37826b9efc62e8b9a28f1b0` on October 30. The pipeline did not update
+the runtime Dart lock. The upstream machine's actual podspec files and gem environment
+are not recorded, so neither changed sources nor JSON serialization differences are
+claimed as the proven historical cause.
+
+The preparation now requires exact original lockfile hashes and applies only the 12
+observed SPEC CHECKSUMS substitutions. A preflight independently reads the pinned plugin
+sources through Flutter's dependency metadata, checks package versions and the enforced
+Dart lock hash, generates podspec JSON with CocoaPods 1.15.2, and verifies every new
+checksum. It archives those JSON files and environment/source metadata. Deployment mode
+still checks the whole native lock, first before vcpkg and again after bridge restoration.
+Failed builds retain diagnostics so any mismatch is inspectable without losing the audit.
+Independent review caught that `uni_links` is a Git dependency rather than a hosted package.
+The audit now separately allows only its exact upstream URL/subdirectory and locked
+`f416118d843a7e9ed117c7bb7bdc2deda5a9e86f` ref, verifies the real local Git HEAD, and
+records Git provenance instead of requiring a nonexistent archive hash.
+
+Local syntax, fixtures, and actual-upstream preparation checks are rerun for this change.
+Ruby is unavailable on the Windows preparation host; the workflow's initial static-check
+step now runs `ruby -c` on the embedded audit before any dependency build. Actual audit
+execution, native compilation, and device acceptance remain for the next run.
