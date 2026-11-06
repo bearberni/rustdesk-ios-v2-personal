@@ -18,10 +18,10 @@ Completed locally on Windows; these results do not establish a working iOS appli
 - Separately, the public source's V2 commit ancestry and the pinned `hbb_common` SHA were
   verified against the existing upstream object database.
 
-Still not run: FFI generation, Rust iOS compilation, Flutter archive, real IPA validation,
-signing, installation, or real-iPhone V2 acceptance.
-The first CI run must establish those build results. Its success must not be inferred
-from local static/fixture checks. Signing and iPhone acceptance remain later steps.
+At the initial preparation stage, FFI generation, Rust iOS compilation, Flutter archive,
+real IPA validation, signing, installation, and real-iPhone acceptance had not run.
+Subsequent CI results below establish specific later progress; they must not be inferred
+from the original fixture tests. Signing and iPhone acceptance remain later steps.
 
 ## First CI run and CocoaPods selection fix
 
@@ -83,3 +83,44 @@ Local syntax, fixtures, and actual-upstream preparation checks are rerun for thi
 Ruby is unavailable on the Windows preparation host; the workflow's initial static-check
 step now runs `ruby -c` on the embedded audit before any dependency build. Actual audit
 execution, native compilation, and device acceptance remain for the next run.
+
+## Fourth CI run, recovered IPA, and FAT framework verification
+
+Run `42188989343`, commit `ecb0b2f931c02e7b62a95a1c79788ee9ca9f2b90`, passed Ruby syntax,
+the actual local-podspec audits (including Git uni_links provenance), both deployment checks,
+FFI generation, and the real Rust iOS core build. `rustdesk` finished release compilation
+in 11m17s. Xcode then successfully archived Runner.xcarchive with bundle ID
+`com.bearberni.rustdesk.v2`, display name `RustDesk V2`, deployment minimum 15.0,
+version 1.5.1, and build number 4.
+
+The CI run failed in the old artifact verifier before corresponding-source packaging and
+manifest production. Its thin-only requirement incorrectly rejected App.framework, a valid
+FAT32 container holding one arm64 iOS-device slice. All other 19 frameworks and the main
+executable are thin arm64 iOS-device binaries. The failure diagnostics artifact was recovered
+with ZIP SHA256 `36b00a29ca6079fdcd114496408bb9f67df7b49d73bd15c2bf87a71c08f7b104`,
+matching the GitHub artifact digest.
+
+The IPA was extracted byte-for-byte, not repackaged, modified, or signed:
+
+```text
+bytes: 27105035
+SHA256: 08d1b073f573221527bf6461b16340787243e6c6519b3194d8f48be55cb32d5c
+```
+
+The verifier now safely parses FAT32/FAT64 in both byte orders, validates every slice's
+architecture and iOS-device load commands, and rejects bad tables, bounds, overlapping
+slices/header, duplicate records, inconsistent headers, alignment errors, simulator/x86
+slices, and invalid reserved fields. It does not ignore unwanted architectures merely
+because an arm64 slice is present. The main executable must have no embedded signature;
+framework ad-hoc signatures may already exist and are left unchanged for normal signing.
+
+Thirteen fixture tests and local static checks passed. The corrected verifier then passed
+on the actual original IPA: all 21 binaries, separate identity, absent URL registration,
+unsigned main app, and linked V2 marker were checked. That is a local static artifact result,
+not a successful original CI run or a real-device result.
+
+The diagnostics do not contain the runner's native .a or generated FFI files. No native .a
+hash or claim of retaining those generated files is made. Any separately prepared source
+package must distinguish the fixed source/recipes/reconstruction inputs from files actually
+retained by this run. At artifact recovery, normal signing, iOS launch, and V2
+enrollment/reconnect acceptance had not run; subsequent acceptance is recorded separately.
