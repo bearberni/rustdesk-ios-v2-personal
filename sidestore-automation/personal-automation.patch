@@ -1,0 +1,952 @@
+diff --git a/AltStore/Managing Apps/AppManager.swift b/AltStore/Managing Apps/AppManager.swift
+index 4f83be72..45968aea 100644
+--- a/AltStore/Managing Apps/AppManager.swift	
++++ b/AltStore/Managing Apps/AppManager.swift	
+@@ -729,6 +729,30 @@ final class AppManager: ObservableObject, @unchecked Sendable
+         
+         return actualGroup
+     }
++
++    /// Automation-only overload: install completion before starting the task,
++    /// propagate its optional evidence scope, and expose activeTask for joining.
++    /// The existing refresh entry point and its behavior are unchanged.
++    func refreshForAutomation(_ app: InstalledApp, dbContext: NSManagedObjectContext,
++                              evidence: AutomationProfileEvidence,
++                              completion: AutomationPipelineCompletion) -> RefreshGroup {
++        let context = self.makeAuthenticatedContext(dbBackgroundContext: dbContext)
++        let group = RefreshGroup(context: context)
++        group.completionHandler = { completion.complete($0) }
++        let handler = self.makePipelineHandler(presentingViewController: nil)
++        let bundleID = app.bundleIdentifier
++        group.activeTask = Task.detached {
++            await AutomationProfileEvidence.$current.withValue(evidence) {
++                do {
++                    try await self.pipelineRunner.perform([.refresh(app)], handler: handler, group: group)
++                } catch {
++                    group.context.error = error
++                    group.completionHandler?([bundleID: .failure(error)])
++                }
++            }
++        }
++        return group
++    }
+     
+     func activate(_ installedApp: InstalledApp, presentingViewController: UIViewController?, completionHandler: @escaping (Result<InstalledApp, Error>) -> Void)
+     {
+diff --git a/AutomationTests/AutomationRefreshPolicyTests.swift b/AutomationTests/AutomationRefreshPolicyTests.swift
+new file mode 100644
+index 00000000..87f8234e
+--- /dev/null
++++ b/AutomationTests/AutomationRefreshPolicyTests.swift
+@@ -0,0 +1,108 @@
++import XCTest
++@testable import SideStoreAutomationPolicy
++
++final class AutomationRefreshPolicyTests: XCTestCase {
++    func testExactOriginalRustDeskIDRejectsOtherClientsAndPrefixes() {
++        XCTAssertTrue(AutomationRefreshPolicy.matchesRustDesk(originalID: "com.bearberni.rustdesk.v2"))
++        for wrong in ["com.carriez.RustDesk", "com.bearberni.rustdesk.v2.other", "com.bearberni.rustdesk", "RustDesk V2"] {
++            XCTAssertFalse(AutomationRefreshPolicy.matchesRustDesk(originalID: wrong))
++        }
++    }
++
++    func testEmptyOrMismatchedCompletionIsNeverSuccess() {
++        XCTAssertFalse(AutomationRefreshPolicy.exactCompletion(requested: "target", resultIDs: [], succeededIDs: []))
++        XCTAssertFalse(AutomationRefreshPolicy.exactCompletion(requested: "target", resultIDs: ["other"], succeededIDs: ["other"]))
++        XCTAssertFalse(AutomationRefreshPolicy.exactCompletion(requested: "target", resultIDs: ["target"], succeededIDs: []))
++        XCTAssertTrue(AutomationRefreshPolicy.exactCompletion(requested: "target", resultIDs: ["target"], succeededIDs: ["target"]))
++    }
++
++    func testLeaseIsHeldThroughNetworkCleanup() {
++        var lease = AutomationLease(runID: "owner", phase: .prepared, report: .init(runID: "owner"))
++        XCTAssertTrue(lease.canExecute("owner"))
++        XCTAssertFalse(lease.canExecute("stale"))
++        lease.phase = .running
++        XCTAssertFalse(lease.canFinalize("owner"))
++        lease.phase = .awaitingCleanup
++        XCTAssertFalse(lease.canFinalize("owner")) // A non-terminal report cannot release.
++        lease.report.terminal = true
++        XCTAssertTrue(lease.canFinalize("owner"))
++        XCTAssertFalse(lease.canFinalize("stale"))
++    }
++
++    func testProcessRestartNeverManufacturesFinallyOrSuccess() {
++        for phase in [AutomationLease.Phase.prepared, .running] {
++            var lease = AutomationLease(runID: "owner", phase: phase, report: .init(runID: "owner"))
++            lease.markProcessInterrupted()
++            XCTAssertEqual(lease.phase, .interrupted)
++            XCTAssertFalse(lease.report.terminal)
++            XCTAssertFalse(lease.report.cleanupAllowed)
++            XCTAssertFalse(lease.report.canCleanup)
++            XCTAssertFalse(lease.canExecute("owner"))
++            XCTAssertFalse(lease.canFinalize("owner"))
++        }
++    }
++
++    func testCompletedRunSurvivesRestartAsCleanupPending() {
++        var report = AutomationRefreshReport(runID: "owner")
++        report.terminal = true
++        report.cleanupAllowed = true
++        var lease = AutomationLease(runID: "owner", phase: .awaitingCleanup, report: report)
++        lease.markProcessInterrupted()
++        XCTAssertEqual(lease.phase, .awaitingCleanup)
++        XCTAssertTrue(lease.canFinalize("owner"))
++    }
++
++    func testLateTerminalWaiterCannotReopenFinalizedLease() {
++        var lease = AutomationLease(runID: "owner", phase: .running, report: .init(runID: "owner"))
++        var terminal = AutomationRefreshReport(runID: "owner")
++        terminal.terminal = true
++        terminal.cleanupAllowed = true
++        terminal.outcome = .success
++        XCTAssertTrue(lease.acceptTerminal(terminal))
++        var lateFailure = terminal
++        lateFailure.outcome = .failed
++        XCTAssertFalse(lease.acceptTerminal(lateFailure))
++        XCTAssertEqual(lease.report.outcome, .success)
++        lease.phase = .finalized
++        XCTAssertFalse(lease.acceptTerminal(lateFailure))
++        XCTAssertEqual(lease.phase, .finalized)
++        lateFailure.runID = "another-run"
++        XCTAssertFalse(lease.acceptTerminal(lateFailure))
++    }
++
++    func testProfileReadbackRequiresUUIDHashIdentityAndFutureValidity() {
++        let now = Date(timeIntervalSince1970: 1_000)
++        func valid(uuid: String = "uuid", hash: String = "hash", bundle: String = "app", team: String = "team", expiry: Date = Date(timeIntervalSince1970: 2_000)) -> Bool {
++            AutomationRefreshPolicy.verifiedProfile(expectedUUID: "uuid", expectedHash: "hash",
++                actualUUID: uuid, actualHash: hash, expectedBundleID: "app", actualBundleID: bundle,
++                expectedTeamID: "team", actualTeamID: team, expiry: expiry, now: now)
++        }
++        XCTAssertTrue(valid())
++        XCTAssertFalse(valid(uuid: "old-profile"))
++        XCTAssertFalse(valid(hash: "different-bytes"))
++        XCTAssertFalse(valid(bundle: "other-app"))
++        XCTAssertFalse(valid(team: "other-team"))
++        XCTAssertFalse(valid(expiry: now))
++    }
++
++    func testPersonalExtensionIDsUseExactInstalledIdentitiesNotMainPrefix() {
++        let main = "com.SideStore.SideStore.TEAM"
++        let widget = "com.SideStore.SideStore.Widget.TEAM"
++        let expected: Set<String> = [main, widget]
++        XCTAssertTrue(AutomationRefreshPolicy.exactProfileIDs(expected: expected, actual: [widget, main]))
++        XCTAssertFalse(AutomationRefreshPolicy.exactProfileIDs(expected: expected, actual: [main, main + ".Widget"]))
++        XCTAssertFalse(AutomationRefreshPolicy.exactProfileIDs(expected: expected, actual: [main, main]))
++    }
++
++    func testJSONContractDoesNotImplySuccessFromTerminalAlone() throws {
++        var report = AutomationRefreshReport(runID: "owner")
++        report.terminal = true
++        report.cleanupAllowed = true
++        report.outcome = .failed
++        let decoded = try JSONDecoder().decode(AutomationRefreshReport.self, from: Data(report.json.utf8))
++        XCTAssertEqual(decoded.schemaVersion, 1)
++        XCTAssertEqual(decoded.runID, "owner")
++        XCTAssertFalse(decoded.rustdesk.completed)
++        XCTAssertEqual(decoded.outcome, .failed)
++    }
++}
+diff --git a/Package.swift b/Package.swift
+new file mode 100644
+index 00000000..90e7cf7e
+--- /dev/null
++++ b/Package.swift
+@@ -0,0 +1,16 @@
++// swift-tools-version: 6.0
++import PackageDescription
++
++// Dependency-free tests of the SAME policy/model file compiled into SideStore.
++// The real AppIntents/CoreData/FFI integration is compiled by the iOS archive job.
++let package = Package(
++    name: "SideStoreAutomationPolicy",
++    platforms: [.macOS(.v13)],
++    products: [.library(name: "SideStoreAutomationPolicy", targets: ["SideStoreAutomationPolicy"])],
++    targets: [
++        .target(name: "SideStoreAutomationPolicy", path: "SideStore/Core/Automation",
++                exclude: ["AutomationRefreshIntent.swift", "AutomationRefreshCoordinator.swift", "AutomationProfileEvidence.swift"],
++                sources: ["AutomationRefreshPolicy.swift"]),
++        .testTarget(name: "SideStoreAutomationPolicyTests", dependencies: ["SideStoreAutomationPolicy"], path: "AutomationTests")
++    ]
++)
+diff --git a/SideStore/Core/Automation/AutomationProfileEvidence.swift b/SideStore/Core/Automation/AutomationProfileEvidence.swift
+new file mode 100644
+index 00000000..2f6df927
+--- /dev/null
++++ b/SideStore/Core/Automation/AutomationProfileEvidence.swift
+@@ -0,0 +1,106 @@
++import Foundation
++import CryptoKit
++import SideSign
++
++/// Present only in the explicit automation task. Ordinary refreshes observe nil.
++final class AutomationProfileEvidence: @unchecked Sendable {
++    @TaskLocal static var current: AutomationProfileEvidence?
++
++    struct Profile: Sendable {
++        var uuid: String
++        var bundleID: String
++        var teamID: String
++        var hash: String
++        var expires: Date
++    }
++
++    private let lock = NSLock()
++    private var planned: [String: Profile] = [:]
++    private var acknowledged = Set<String>()
++    private var mainUUID: String?
++    let mainBundleID: String
++    let certificateSerial: String
++    let expectedProfileIDs: Set<String>
++
++    init(mainBundleID: String, certificateSerial: String, expectedProfileIDs: Set<String>) {
++        self.mainBundleID = mainBundleID
++        self.certificateSerial = certificateSerial
++        self.expectedProfileIDs = expectedProfileIDs
++    }
++
++    static func hash(_ data: Data) -> String {
++        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
++    }
++
++    func plan(_ profiles: [String: ALTProvisioningProfile], mainKey: String) throws {
++        guard AutomationRefreshPolicy.exactProfileIDs(expected: expectedProfileIDs,
++                  actual: profiles.values.map(\.bundleIdentifier)), let main = profiles[mainKey],
++              main.bundleIdentifier == mainBundleID else { throw AutomationFailure("profilePlanMismatch") }
++        var values: [String: Profile] = [:]
++        for profile in profiles.values {
++            guard profile.expirationDate > Date(),
++                  profile.certificates.contains(where: { $0.serialNumber == certificateSerial }) else {
++                throw AutomationFailure("profileIdentityMismatch")
++            }
++            let item = Profile(uuid: profile.uuid.uuidString, bundleID: profile.bundleIdentifier,
++                               teamID: profile.teamIdentifier, hash: Self.hash(profile.data), expires: profile.expirationDate)
++            guard values.updateValue(item, forKey: item.uuid) == nil else { throw AutomationFailure("duplicateProfile") }
++        }
++        lock.withLock {
++            planned = values
++            mainUUID = main.uuid.uuidString
++        }
++    }
++
++    /// Called only AFTER the native misagent installation call has returned.
++    func didInstall(_ profile: ALTProvisioningProfile) {
++        lock.withLock { _ = acknowledged.insert(profile.uuid.uuidString) }
++    }
++
++    func snapshot() throws -> (profiles: [Profile], main: Profile) {
++        try lock.withLock {
++            guard !planned.isEmpty, Set(planned.keys) == acknowledged,
++                  let uuid = mainUUID, let main = planned[uuid] else { throw AutomationFailure("nativeInstallEvidenceMissing") }
++            return (Array(planned.values), main)
++        }
++    }
++
++    /// Fresh private dump, populated by a live misagent copy_all round trip.
++    /// No existing cache, app's old embedded profile or database date is proof.
++    func verifyInstalledOnDevice() async throws -> (profiles: [Profile], main: Profile) {
++        let captured = try snapshot()
++        let root = FileManager.default.temporaryDirectory.appendingPathComponent("AutomationProfileCheck-" + UUID().uuidString, isDirectory: true)
++        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: root) }
++        let returned = try await dumpProfiles(root.path)
++        let expectedDirectory = root.appendingPathComponent("PROVISION", isDirectory: true).standardizedFileURL
++        guard URL(fileURLWithPath: returned).standardizedFileURL == expectedDirectory else {
++            throw AutomationFailure("profileReadbackUnavailable")
++        }
++        for item in captured.profiles {
++            // UUIDs are parsed by SideSign, never accepted as arbitrary paths.
++            guard UUID(uuidString: item.uuid) != nil else { throw AutomationFailure("invalidProfileUUID") }
++            let file = expectedDirectory.appendingPathComponent(item.uuid + ".mobileprovision")
++            let attrs = try file.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey])
++            guard attrs.isSymbolicLink != true, let size = attrs.fileSize, size > 0, size < 2_000_000 else {
++                throw AutomationFailure("invalidProfileReadback")
++            }
++            let data = try Data(contentsOf: file)
++            let actual = try ALTProvisioningProfile(data: data)
++            guard AutomationRefreshPolicy.verifiedProfile(
++                expectedUUID: item.uuid, expectedHash: item.hash,
++                actualUUID: actual.uuid.uuidString, actualHash: Self.hash(data),
++                expectedBundleID: item.bundleID, actualBundleID: actual.bundleIdentifier,
++                expectedTeamID: item.teamID, actualTeamID: actual.teamIdentifier,
++                expiry: actual.expirationDate, now: Date()) else {
++                throw AutomationFailure("deviceProfileMismatch")
++            }
++        }
++        return captured
++    }
++}
++
++struct AutomationFailure: Error, Sendable {
++    let code: String
++    init(_ code: String) { self.code = code }
++}
+diff --git a/SideStore/Core/Automation/AutomationRefreshCoordinator.swift b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
+new file mode 100644
+index 00000000..2e6def62
+--- /dev/null
++++ b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
+@@ -0,0 +1,313 @@
++import Foundation
++@preconcurrency import CoreData
++import SideSign
++
++final class AutomationCancellation: @unchecked Sendable {
++    private let lock = NSLock()
++    private var cancelled = false
++    private var group: RefreshGroup?
++    var isCancelled: Bool { lock.withLock { cancelled } }
++    func cancel() {
++        let current = lock.withLock { cancelled = true; return group }
++        current?.cancel()
++    }
++    func attach(_ newGroup: RefreshGroup?) {
++        let shouldCancel = lock.withLock { group = newGroup; return cancelled }
++        if shouldCancel { newGroup?.cancel() }
++    }
++    func check() throws {
++        if isCancelled || Task.isCancelled { throw CancellationError() }
++    }
++}
++
++/// No checked continuation is needed: completion is installed before startup,
++/// and callers join activeTask before reading this exactly-once result box.
++final class AutomationPipelineCompletion: @unchecked Sendable {
++    private let lock = NSLock()
++    private var results: [String: Result<InstalledApp, Error>]?
++    private var count = 0
++    func complete(_ value: [String: Result<InstalledApp, Error>]) {
++        lock.withLock {
++            count += 1
++            if results == nil { results = value }
++        }
++    }
++    func value() throws -> [String: Result<InstalledApp, Error>] {
++        try lock.withLock {
++            guard count == 1, let results else { throw AutomationFailure("invalidCompletionCount") }
++            return results
++        }
++    }
++}
++
++actor AutomationRefreshCoordinator {
++    static let shared = AutomationRefreshCoordinator()
++    private var lease: AutomationLease?
++    private var worker: Task<AutomationRefreshReport, Never>?
++    private var cancellation: AutomationCancellation?
++    private var storageFailed = false
++    private let journalURL: URL
++
++    init() {
++        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
++            ?? FileManager.default.temporaryDirectory
++        journalURL = base.appendingPathComponent("SideStoreAutomation", isDirectory: true).appendingPathComponent("lease-v1.json")
++        if FileManager.default.fileExists(atPath: journalURL.path) {
++            do {
++                let bytes = try Data(contentsOf: journalURL)
++                guard bytes.count < 256_000 else { throw AutomationFailure("invalidJournal") }
++                var previous = try JSONDecoder().decode(AutomationLease.self, from: bytes)
++                previous.markProcessInterrupted()
++                lease = previous
++            } catch { storageFailed = true }
++        }
++    }
++
++    private func persist() throws {
++        try FileManager.default.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
++        let data = try JSONEncoder().encode(lease)
++        try data.write(to: journalURL, options: .atomic)
++    }
++
++    func prepare() -> AutomationPrepareReport {
++        guard !storageFailed else {
++            return .init(ready: false, runID: "", outcome: "unverified", errors: [.init(code: "journalUnavailable", app: nil)])
++        }
++        if let current = lease, current.phase != .finalized {
++            return .init(ready: false, runID: current.runID,
++                         outcome: current.phase == .interrupted ? "interrupted" : "busy")
++        }
++        let id = UUID().uuidString
++        lease = .init(runID: id, phase: .prepared, report: .init(runID: id))
++        do { try persist() }
++        catch {
++            storageFailed = true
++            return .init(ready: false, runID: id, outcome: "unverified", errors: [.init(code: "journalUnavailable", app: nil)])
++        }
++        return .init(ready: true, runID: id, outcome: "ready")
++    }
++
++    /// For a legitimate Prepare ticket this method never returns while its
++    /// backend is active. Cancellation requests cancel AND JOIN that backend.
++    /// A normal shortcut can save this raw result, restore VPNs, then Finalize.
++    func execute(runID: String, progress: Progress, cancellation requestedCancellation: AutomationCancellation) async -> AutomationRefreshReport {
++        guard let current = lease, current.runID == runID else { return invalidTicket(runID) }
++        if current.phase == .awaitingCleanup { return current.report }
++        if current.phase == .running, let existing = worker { return await existing.value }
++        guard current.canExecute(runID), !storageFailed else { return invalidTicket(runID) }
++
++        lease?.phase = .running
++        do { try persist() }
++        catch { return finishWithoutWorker(runID, outcome: .unverified, code: "journalUnavailable") }
++        cancellation = requestedCancellation
++        let task = Task.detached {
++            await AutomationRefreshWorker.run(runID: runID, progress: progress, cancellation: requestedCancellation)
++        }
++        worker = task
++        let report = await withTaskCancellationHandler {
++            await task.value
++        } onCancel: {
++            requestedCancellation.cancel()
++        }
++        return storeTerminal(report)
++    }
++
++    func cancelAndDrain(runID: String, cancellation requestedCancellation: AutomationCancellation) async -> AutomationRefreshReport {
++        guard let current = lease, current.runID == runID else { return invalidTicket(runID) }
++        requestedCancellation.cancel()
++        cancellation?.cancel()
++        if let task = worker { return storeTerminal(await task.value) }
++        if current.phase == .awaitingCleanup { return current.report }
++        if current.phase == .prepared {
++            return finishWithoutWorker(runID, outcome: .cancelled, code: "executionNotStarted")
++        }
++        return invalidTicket(runID)
++    }
++
++    private func finishWithoutWorker(_ runID: String, outcome: AutomationRefreshReport.Outcome, code: String) -> AutomationRefreshReport {
++        var report = AutomationRefreshReport(runID: runID)
++        report.terminal = true
++        report.cleanupAllowed = true
++        report.outcome = outcome
++        report.errors = [.init(code: code, app: nil)]
++        return storeTerminal(report)
++    }
++
++    private func storeTerminal(_ value: AutomationRefreshReport) -> AutomationRefreshReport {
++        guard var current = lease, current.runID == value.runID else { return invalidTicket(value.runID) }
++        if current.phase == .awaitingCleanup || current.phase == .finalized {
++            return current.report
++        }
++        guard current.acceptTerminal(value) else { return invalidTicket(value.runID) }
++        var report = value
++        // Worker returned only after joining every native operation it started.
++        lease = current
++        worker = nil
++        cancellation = nil
++        do { try persist() }
++        catch {
++            storageFailed = true
++            report.outcome = .unverified
++            report.errors.append(.init(code: "journalUnavailable", app: nil))
++            lease?.report = report
++        }
++        return report
++    }
++
++    func finalize(runID: String) -> String {
++        guard let current = lease, current.canFinalize(runID), worker == nil else {
++            return AutomationFinalizeReport(runID: runID, finalized: false, released: false, outcome: "invalidTicket").json
++        }
++        lease?.phase = .finalized
++        do { try persist() }
++        catch {
++            lease?.phase = .awaitingCleanup
++            storageFailed = true
++            return AutomationFinalizeReport(runID: runID, finalized: false, released: false, outcome: "journalUnavailable").json
++        }
++        return AutomationFinalizeReport(runID: runID, finalized: true, released: true, outcome: "finalized").json
++    }
++
++    func status() -> AutomationRefreshReport {
++        lease?.report ?? invalidTicket("")
++    }
++
++    private func invalidTicket(_ id: String) -> AutomationRefreshReport {
++        var report = AutomationRefreshReport(runID: id)
++        report.errors = [.init(code: "invalidOrInterruptedTicket", app: nil)]
++        // Never grant a stale/invalid caller permission to change another run's VPN.
++        return report
++    }
++}
++
++private struct AutomationTarget: @unchecked Sendable {
++    let app: InstalledApp
++    let originalID: String
++    let installedID: String
++    let certificateSerial: String
++    let profileIDs: Set<String>
++}
++
++private enum AutomationRefreshWorker {
++    static func run(runID: String, progress: Progress, cancellation: AutomationCancellation) async -> AutomationRefreshReport {
++        var report = AutomationRefreshReport(runID: runID)
++        progress.totalUnitCount = 220
++        progress.localizedDescription = "Renewing RustDesk V2 and SideStore"
++        do {
++            try cancellation.check()
++            try await DatabaseManager.shared.start()
++            guard !CellularRefreshManager.shared.isEnabled else { throw AutomationFailure("cellularRefreshMustBeDisabled") }
++            guard !AppManager.shared.isActivelyManagingAnyApp else { throw AutomationFailure("anotherOperationActive") }
++            _ = try await AuthManager.shared.getAuthenticatedTeam()
++            _ = try await AuthManager.shared.getAuthenticatedSession()
++            try cancellation.check()
++            let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
++            let targets = try await context.perform { try findTargets(context: context) }
++            report.rustdesk.bundleID = targets[0].installedID
++            report.sidestore.bundleID = targets[1].installedID
++            progress.completedUnitCount = 10
++
++            for (index, target) in targets.enumerated() {
++                try cancellation.check()
++                guard !AppManager.shared.isActivelyManagingAnyApp else { throw AutomationFailure("anotherOperationActive") }
++                progress.localizedAdditionalDescription = index == 0 ? "Refreshing RustDesk V2" : "Refreshing SideStore"
++                let evidence = AutomationProfileEvidence(mainBundleID: target.installedID,
++                    certificateSerial: target.certificateSerial, expectedProfileIDs: target.profileIDs)
++                let completion = AutomationPipelineCompletion()
++                let group = await context.perform {
++                    AppManager.shared.refreshForAutomation(target.app, dbContext: context, evidence: evidence, completion: completion)
++                }
++                cancellation.attach(group)
++                progress.addChild(group.progress, withPendingUnitCount: 100)
++                guard let active = group.activeTask else { throw AutomationFailure("missingBackendTask") }
++                // Do not race a timeout, UI notification or cancellation against
++                // completion. Native FFI may not cancel immediately: JOIN it.
++                await active.value
++                cancellation.attach(nil)
++                try cancellation.check()
++                let result = try completion.value()
++                let ids = result.keys.sorted()
++                let successes = try await context.perform { () throws -> [String] in
++                    try result.map { id, value in
++                        let app = try value.get()
++                        guard app.bundleIdentifier == target.originalID,
++                              app.resignedBundleIdentifier == target.installedID else {
++                            throw AutomationFailure("completionIdentityMismatch")
++                        }
++                        return id
++                    }.sorted()
++                }
++                guard AutomationRefreshPolicy.exactCompletion(requested: target.originalID,
++                    resultIDs: ids, succeededIDs: successes) else { throw AutomationFailure("emptyOrMismatchedResult") }
++                progress.localizedAdditionalDescription = "Verifying installed profiles"
++                let proof: (profiles: [AutomationProfileEvidence.Profile], main: AutomationProfileEvidence.Profile)
++                do { proof = try await evidence.verifyInstalledOnDevice() }
++                catch { throw AutomationFailure("deviceProfileVerificationUnavailable") }
++                try cancellation.check()
++                let appReport = AutomationAppReport(completed: true, bundleID: target.installedID,
++                    expiresAt: AutomationRefreshPolicy.timestamp(proof.main.expires),
++                    installedProfileUUIDs: proof.profiles.map(\.uuid).sorted())
++                if index == 0 { report.rustdesk = appReport } else { report.sidestore = appReport }
++            }
++            guard report.rustdesk.completed && report.sidestore.completed else { throw AutomationFailure("missingTargetCompletion") }
++            report.outcome = .success
++        } catch {
++            let code = (error as? AutomationFailure)?.code ?? "refreshFailedSeeSideStoreLog"
++            if cancellation.isCancelled || error is CancellationError {
++                report.outcome = .cancelled
++            } else if ["deviceProfileVerificationUnavailable", "nativeInstallEvidenceMissing", "invalidCompletionCount", "emptyOrMismatchedResult"].contains(code) {
++                report.outcome = .unverified
++            } else { report.outcome = .failed }
++            report.errors.append(.init(code: code, app: !report.rustdesk.completed ? "rustdesk" : "sidestore"))
++        }
++        // No detached backend remains here. Killing the process is different:
++        // no report is returned, and its persisted lease stays interrupted.
++        report.terminal = true
++        report.cleanupAllowed = true
++        progress.completedUnitCount = progress.totalUnitCount
++        return report
++    }
++
++    private static func findTargets(context: NSManagedObjectContext) throws -> [AutomationTarget] {
++        let all = InstalledApp.all(in: context)
++        let rustdesk = all.filter { AutomationRefreshPolicy.matchesRustDesk(originalID: $0.bundleIdentifier) }
++        let own = all.filter { $0.bundleIdentifier == StoreApp.altstoreAppID }
++        guard rustdesk.count == 1, own.count == 1 else { throw AutomationFailure("missingOrAmbiguousTarget") }
++        return try [rustdesk[0], own[0]].enumerated().map { index, app in
++            guard app.isActive, let bundle = ALTApplication(fileURL: app.fileURL),
++                  let certificate = CertificateManager.shared.getSigningCertificate(at: bundle.fileURL) else {
++                throw AutomationFailure("targetOrSigningIdentityUnavailable")
++            }
++            let installed = app.resignedBundleIdentifier
++            if index == 0 {
++                guard let team = app.team?.identifier,
++                      installed == AutomationRefreshPolicy.rustDeskID || installed == AutomationRefreshPolicy.rustDeskID + "." + team,
++                      app.customBundleIdentifier == nil || app.customBundleIdentifier == AutomationRefreshPolicy.rustDeskID else {
++                    throw AutomationFailure("rustdeskIdentityMismatch")
++                }
++            } else {
++                guard installed == Bundle.main.bundleIdentifier else { throw AutomationFailure("sidestoreIdentityMismatch") }
++            }
++            guard bundle.bundleIdentifier == app.bundleIdentifier || bundle.bundleIdentifier == installed else {
++                throw AutomationFailure("cachedBundleIdentityMismatch")
++            }
++            var profileIDs: Set<String> = [installed]
++            if !app.useMainProfile {
++                // Personal signing may place TEAM after each entire extension ID,
++                // rather than reparenting it under the signed main ID. Use the
++                // installed database identities, never a guessed prefix.
++                guard app.appExtensions.count == bundle.appExtensions.count else {
++                    throw AutomationFailure("extensionIdentityUnavailable")
++                }
++                for ext in app.appExtensions {
++                    guard !ext.resignedBundleIdentifier.isEmpty,
++                          profileIDs.insert(ext.resignedBundleIdentifier).inserted else {
++                        throw AutomationFailure("extensionIdentityUnavailable")
++                    }
++                }
++            }
++            return AutomationTarget(app: app, originalID: app.bundleIdentifier, installedID: installed,
++                certificateSerial: certificate.serialNumber, profileIDs: profileIDs)
++        }
++    }
++}
+diff --git a/SideStore/Core/Automation/AutomationRefreshIntent.swift b/SideStore/Core/Automation/AutomationRefreshIntent.swift
+new file mode 100644
+index 00000000..887be4be
+--- /dev/null
++++ b/SideStore/Core/Automation/AutomationRefreshIntent.swift
+@@ -0,0 +1,63 @@
++import AppIntents
++import Foundation
++
++@available(iOS 27.0, *)
++struct PrepareAutomationIntent: AppIntent {
++    static var title: LocalizedStringResource = "Prepare Automatic Renewal"
++    static var description = IntentDescription("Reserve a renewal run before changing VPNs. A busy result must not change the network.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        .result(value: await AutomationRefreshCoordinator.shared.prepare().json)
++    }
++}
++
++@available(iOS 27.0, *)
++struct AutomationRefreshIntent: LongRunningIntent, CancellableIntent {
++    static var title: LocalizedStringResource = "Renew RustDesk V2 and SideStore"
++    static var description = IntentDescription("Wait for sequential profile renewal and device verification; return a terminal JSON result, including ordinary failures.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
++
++    @Parameter(title: "Run ID") var runID: String
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        let cancellation = AutomationCancellation()
++        let report: AutomationRefreshReport
++        do {
++            report = try await performBackgroundTask {
++                await AutomationRefreshCoordinator.shared.execute(runID: runID, progress: progress, cancellation: cancellation)
++            } onCancel: { _ in
++                cancellation.cancel()
++            }
++        } catch {
++            // Even a runtime-extension failure must not return a legitimate
++            // ticket before its backend is cancelled and joined. OS process
++            // termination cannot run this code; the journal keeps that distinct.
++            report = await AutomationRefreshCoordinator.shared.cancelAndDrain(runID: runID, cancellation: cancellation)
++        }
++        return .result(value: report.json)
++    }
++}
++
++@available(iOS 27.0, *)
++struct FinalizeAutomationIntent: AppIntent {
++    static var title: LocalizedStringResource = "Finish Renewal Network Recovery"
++    static var description = IntentDescription("Release the matching run only after the shortcut has restored its VPN configuration.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
++    @Parameter(title: "Run ID") var runID: String
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        .result(value: await AutomationRefreshCoordinator.shared.finalize(runID: runID))
++    }
++}
++
++@available(iOS 27.0, *)
++struct AutomationStatusIntent: AppIntent {
++    static var title: LocalizedStringResource = "Get Last Renewal Status"
++    static var description = IntentDescription("Read the persisted last result. An interrupted process is not reported as a completed renewal.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        .result(value: await AutomationRefreshCoordinator.shared.status().json)
++    }
++}
+diff --git a/SideStore/Core/Automation/AutomationRefreshPolicy.swift b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
+new file mode 100644
+index 00000000..49a93bbb
+--- /dev/null
++++ b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
+@@ -0,0 +1,126 @@
++import Foundation
++
++/// The shortcut obtains a lease before changing VPNs and releases it only AFTER
++/// restoring the network. An abandoned lease is never silently stolen.
++struct AutomationLease: Codable, Sendable, Equatable {
++    enum Phase: String, Codable, Sendable {
++        case prepared, running, awaitingCleanup, finalized, interrupted
++    }
++    var runID: String
++    var phase: Phase
++    var report: AutomationRefreshReport
++
++    func canExecute(_ token: String) -> Bool {
++        runID == token && phase == .prepared
++    }
++
++    func canFinalize(_ token: String) -> Bool {
++        runID == token && phase == .awaitingCleanup && report.terminal
++    }
++
++    /// Multiple cancellation/execute waiters can join the same backend. Only
++    /// the first terminal commit may advance the lease; late waiters cannot
++    /// reopen a run whose network cleanup has already been finalized.
++    mutating func acceptTerminal(_ value: AutomationRefreshReport) -> Bool {
++        guard runID == value.runID, value.terminal,
++              phase == .prepared || phase == .running else { return false }
++        report = value
++        phase = .awaitingCleanup
++        return true
++    }
++
++    mutating func markProcessInterrupted() {
++        guard phase == .prepared || phase == .running else { return }
++        phase = .interrupted
++        report.terminal = false
++        report.cleanupAllowed = false
++        report.outcome = .unverified
++        report.errors.append(.init(code: "processInterrupted", app: nil))
++    }
++}
++
++struct AutomationRefreshError: Codable, Sendable, Equatable {
++    var code: String
++    var app: String?
++}
++
++struct AutomationAppReport: Codable, Sendable, Equatable {
++    var completed = false
++    var bundleID: String
++    var expiresAt: String?
++    var installedProfileUUIDs: [String] = []
++}
++
++struct AutomationRefreshReport: Codable, Sendable, Equatable {
++    enum Outcome: String, Codable, Sendable { case success, failed, cancelled, unverified }
++    var schemaVersion = 1
++    var runID: String
++    var terminal = false
++    var cleanupAllowed = false
++    var outcome: Outcome = .unverified
++    var rustdesk = AutomationAppReport(bundleID: AutomationRefreshPolicy.rustDeskID)
++    var sidestore = AutomationAppReport(bundleID: "")
++    var errors: [AutomationRefreshError] = []
++    var canCleanup: Bool { terminal && cleanupAllowed }
++
++    var json: String {
++        // Every field is a bounded Codable value; no Apple responses/credentials.
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.sortedKeys]
++        guard let data = try? encoder.encode(self), let text = String(data: data, encoding: .utf8) else {
++            return "{\"schemaVersion\":1,\"terminal\":false,\"cleanupAllowed\":false,\"outcome\":\"unverified\",\"errors\":[{\"code\":\"encodingFailed\"}]}"
++        }
++        return text
++    }
++}
++
++struct AutomationPrepareReport: Codable, Sendable {
++    var schemaVersion = 1
++    var ready: Bool
++    var runID: String
++    var outcome: String
++    var errors: [AutomationRefreshError] = []
++    var json: String {
++        String(data: (try? JSONEncoder().encode(self)) ?? Data(), encoding: .utf8) ?? "{}"
++    }
++}
++
++struct AutomationFinalizeReport: Codable, Sendable {
++    var schemaVersion = 1
++    var runID: String
++    var finalized: Bool
++    var released: Bool
++    var outcome: String
++    var json: String {
++        String(data: (try? JSONEncoder().encode(self)) ?? Data(), encoding: .utf8) ?? "{}"
++    }
++}
++
++enum AutomationRefreshPolicy {
++    static let rustDeskID = "com.bearberni.rustdesk.v2"
++
++    /// Original ID must match exactly. A name/prefix match could select the
++    /// App Store client or another RustDesk build and is deliberately rejected.
++    static func matchesRustDesk(originalID: String) -> Bool { originalID == rustDeskID }
++
++    static func exactCompletion(requested: String, resultIDs: [String], succeededIDs: [String]) -> Bool {
++        resultIDs == [requested] && succeededIDs == [requested]
++    }
++
++    static func exactProfileIDs(expected: Set<String>, actual: [String]) -> Bool {
++        !expected.isEmpty && Set(actual).count == actual.count && Set(actual) == expected
++    }
++
++    static func verifiedProfile(expectedUUID: String, expectedHash: String,
++                                actualUUID: String, actualHash: String,
++                                expectedBundleID: String, actualBundleID: String,
++                                expectedTeamID: String, actualTeamID: String,
++                                expiry: Date, now: Date) -> Bool {
++        expectedUUID == actualUUID && expectedHash == actualHash &&
++        expectedBundleID == actualBundleID && expectedTeamID == actualTeamID && expiry > now
++    }
++
++    static func timestamp(_ date: Date) -> String {
++        ISO8601DateFormatter().string(from: date)
++    }
++}
+diff --git a/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift b/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift
+index 64b31937..05b82483 100644
+--- a/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift
++++ b/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift
+@@ -49,6 +49,17 @@ final class PreflightChecksOperation: BasePipelineOperation<StandaloneOperationC
+             guard isSideStore else { continue }
+             guard let installedApp = operation.app as? InstalledApp else { continue }
+ 
++            if AutomationProfileEvidence.current != nil, case .refresh = operation {
++                // Ordinary .refresh never offers a resign/mismatch dialog. For
++                // this explicit automation path, validate the self identity on
++                // its owning queue and leave all other operations unchanged.
++                let matches = await self.context.dbBackgroundContext.perform {
++                    installedApp.resignedBundleIdentifier == Bundle.main.bundleIdentifier
++                }
++                guard matches else { throw AutomationFailure("sidestoreIdentityMismatch") }
++                continue
++            }
++
+             let activeResignedID = installedApp.resignedBundleIdentifier
+             let activeEffectiveID = installedApp.customBundleIdentifier ?? activeResignedID
+ 
+diff --git a/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift b/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift
+index cebf3617..e5cdc609 100644
+--- a/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift
++++ b/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift
+@@ -24,6 +24,10 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
+         guard let profiles = self.context.provisioningProfiles else {
+             throw OperationError.invalidParameters("RefreshAppOperation.execute: self.context.provisioningProfiles is nil")
+         }
++        guard profiles[self.context.targetBundleIdentifier] != nil else {
++            throw OperationError.invalidParameters("RefreshAppOperation: main provisioning profile is missing.")
++        }
++        try AutomationProfileEvidence.current?.plan(profiles, mainKey: self.context.targetBundleIdentifier)
+         
+         guard let appBundle = self.context.targetAppBundle else { throw OperationError.appNotFound(name: nil) }
+         self.setProgress(10)
+@@ -31,7 +35,9 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
+         do {
+             await CellularRefreshManager.shared.turnOffDataIfNeeded()
+             for p in profiles {
++                if AutomationProfileEvidence.current != nil { try Task.checkCancellation() }
+                 try await installProvisioningProfiles(p.value.data)
++                AutomationProfileEvidence.current?.didInstall(p.value)
+             }
+             await CellularRefreshManager.shared.turnOnDataIfNeeded()
+         } catch {
+@@ -57,7 +63,10 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
+               let installedApp = dbContext.object(with: mainApp.objectID) as? InstalledApp else {
+             throw OperationError.appNotFound(name: appBundle.name)
+         }
+-        installedApp.update(provisioningProfile: profiles.values.first!)
++        guard let mainProfile = profiles[self.context.targetBundleIdentifier] else {
++            throw OperationError.invalidParameters("RefreshAppOperation: main provisioning profile is missing.")
++        }
++        installedApp.update(provisioningProfile: mainProfile)
+         
+         if let certStatus = self.context.targetCertStatus {
+             installedApp.certificateStatus = certStatus
+diff --git a/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift b/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift
+index 192ef75c..01776a2a 100644
+--- a/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift
++++ b/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift
+@@ -21,6 +21,16 @@ final class UpdateAppCertificateOperation: BasePipelineOperation<InstallAppOpera
+             debugLog("[UpdateAppCertificateOperation] execute() took: \(String(format: "%.3fs", elapsed))")
+         }
+         try await super.executePreconditionCheck(parentProgress: parentProgress)
++
++        if let evidence = AutomationProfileEvidence.current {
++            // The automation target's binary signing serial was captured on its
++            // MOC queue. Reuse an existing local identity only; do not create,
++            // replace, revoke or export a certificate, or dereference the
++            // InstalledApp from this executor.
++            self.context.overrideSigningCertificate = CertificateManager.shared.getSignableCertificate(for: evidence.certificateSerial)
++            self.setProgress(100)
++            return
++        }
+         
+         if let installedApp = self.context.installedApp, let serialNumber = installedApp.certificateSerialNumber {
+             debugLog("[UpdateAppCertificateOperation] InstalledApp '\(installedApp.name)' has custom certificate serial: '\(serialNumber)'")
+diff --git a/SideStore/Core/Operations/PipelineRunner.swift b/SideStore/Core/Operations/PipelineRunner.swift
+index 0142c0cc..f46f6fe0 100644
+--- a/SideStore/Core/Operations/PipelineRunner.swift
++++ b/SideStore/Core/Operations/PipelineRunner.swift
+@@ -214,11 +214,14 @@ final class PipelineRunner: Sendable
+         do {
+             let result = try await self.performPipeline(for: operation, handler: handler, group: group)
+             progress.set(nil, for: operation)
+-            debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(result.bundleIdentifier)")
+-            
+-            // persist the result
+-            let bundleID = result.bundleIdentifier
+             let dbContext = group.context.dbBackgroundContext
++            let bundleID: String
++            if AutomationProfileEvidence.current != nil {
++                bundleID = await dbContext.perform { result.bundleIdentifier }
++            } else { bundleID = result.bundleIdentifier }
++            debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(bundleID)")
++
++            // persist the result
+             do {
+                 try await dbContext.perform {
+                     let hasChanges = dbContext.hasChanges
+@@ -241,7 +244,7 @@ final class PipelineRunner: Sendable
+             await WidgetDataManager.publishCurrentInstalledApps(in: dbContext)
+             debugLog("[AppManager] performOperation: Reloading COMPLETE for widget timelines.")
+             
+-            if result.bundleIdentifier == StoreApp.altstoreAppID {
++            if bundleID == StoreApp.altstoreAppID {
+                 let context = StandaloneOperationContext(steps: .scheduleExpirationWarningNotification, dbBackgroundContext: group.context.dbBackgroundContext)
+                 let scheduleNotifOp = try ScheduleExpirationWarningNotificationOperation(
+                     installedApp: result,
+@@ -289,10 +292,23 @@ final class PipelineRunner: Sendable
+         if case .resign(_,  let mode)     = operation { context.alternateIconMode       = mode }
+         
+         if let app = operation.app as? InstalledApp {
+-            context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
+-            context.useMainProfile = app.useMainProfile
+-            context.customBundleIdentifier = app.customBundleIdentifier
+-            context.installedApp = app
++            if AutomationProfileEvidence.current != nil {
++                guard case .refresh = operation else { throw AutomationFailure("unexpectedAutomationOperation") }
++                try await group.context.dbBackgroundContext.perform {
++                    guard app.managedObjectContext === group.context.dbBackgroundContext else {
++                        throw AutomationFailure("managedObjectContextMismatch")
++                    }
++                    context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
++                    context.useMainProfile = app.useMainProfile
++                    context.customBundleIdentifier = app.customBundleIdentifier
++                    context.installedApp = app
++                }
++            } else {
++                context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
++                context.useMainProfile = app.useMainProfile
++                context.customBundleIdentifier = app.customBundleIdentifier
++                context.installedApp = app
++            }
+         }
+         
+         context.beginInstallationHandler = { (installedApp) in
+@@ -300,7 +316,7 @@ final class PipelineRunner: Sendable
+         }
+         
+         var downloadingApp = operation.app
+-        if let installedApp = operation.app as? InstalledApp {
++        if AutomationProfileEvidence.current == nil, let installedApp = operation.app as? InstalledApp {
+             if case .resign = operation { downloadingApp = installedApp }
+             else if let storeApp = installedApp.storeApp, !FileManager.default.fileExists(atPath: installedApp.fileURL.path) {
+                 downloadingApp = storeApp
