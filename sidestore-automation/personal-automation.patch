@@ -35,14 +35,38 @@ index 4f83be72..45968aea 100644
      {
 diff --git a/AutomationTests/AutomationRefreshPolicyTests.swift b/AutomationTests/AutomationRefreshPolicyTests.swift
 new file mode 100644
-index 00000000..87f8234e
+index 00000000..08d0acf2
 --- /dev/null
 +++ b/AutomationTests/AutomationRefreshPolicyTests.swift
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,132 @@
 +import XCTest
 +@testable import SideStoreAutomationPolicy
 +
 +final class AutomationRefreshPolicyTests: XCTestCase {
++    func testReadinessRetriesOnlyNetworkSetupFailures() {
++        for failure in [AutomationRefreshPolicy.ReadinessFailure.networkUnavailable, .missingTunnel, .endpointNotReady, .peerUnreachable] {
++            XCTAssertTrue(AutomationRefreshPolicy.mayRetryReadiness(failure, remotePairing: true))
++        }
++        XCTAssertTrue(AutomationRefreshPolicy.mayRetryReadiness(.invalidVPN, remotePairing: true))
++        XCTAssertFalse(AutomationRefreshPolicy.mayRetryReadiness(.invalidVPN, remotePairing: false))
++    }
++
++    func testReadinessNeverRetriesPairingLockedOrUnknownFailures() {
++        for failure in [AutomationRefreshPolicy.ReadinessFailure.invalidPairing, .locked, .unknown] {
++            XCTAssertFalse(AutomationRefreshPolicy.mayRetryReadiness(failure, remotePairing: true))
++        }
++        XCTAssertTrue(AutomationRefreshPolicy.readinessReasonIsPermanent("Device is locked; unlock required"))
++        XCTAssertTrue(AutomationRefreshPolicy.readinessReasonIsPermanent("Invalid pairing record"))
++        XCTAssertFalse(AutomationRefreshPolicy.readinessReasonIsPermanent("Tunnel peer IP not yet reachable"))
++    }
++
++    func testReadinessWindowIsPreparationOnlyAndStopsAtThirtySeconds() {
++        XCTAssertTrue(AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: 100, now: 100))
++        XCTAssertTrue(AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: 100, now: 129.999))
++        XCTAssertFalse(AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: 100, now: 130))
++        XCTAssertFalse(AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: 100, now: 131))
++    }
++
 +    func testExactOriginalRustDeskIDRejectsOtherClientsAndPrefixes() {
 +        XCTAssertTrue(AutomationRefreshPolicy.matchesRustDesk(originalID: "com.bearberni.rustdesk.v2"))
 +        for wrong in ["com.carriez.RustDesk", "com.bearberni.rustdesk.v2.other", "com.bearberni.rustdesk", "RustDesk V2"] {
@@ -283,13 +307,14 @@ index 00000000..2f6df927
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshCoordinator.swift b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
 new file mode 100644
-index 00000000..2e6def62
+index 00000000..d5df6eba
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
-@@ -0,0 +1,313 @@
+@@ -0,0 +1,376 @@
 +import Foundation
 +@preconcurrency import CoreData
 +import SideSign
++import Minimuxer
 +
 +final class AutomationCancellation: @unchecked Sendable {
 +    private let lock = NSLock()
@@ -487,6 +512,7 @@ index 00000000..2e6def62
 +            try await DatabaseManager.shared.start()
 +            guard !CellularRefreshManager.shared.isEnabled else { throw AutomationFailure("cellularRefreshMustBeDisabled") }
 +            guard !AppManager.shared.isActivelyManagingAnyApp else { throw AutomationFailure("anotherOperationActive") }
++            try await waitForNetworkReady(progress: progress, cancellation: cancellation)
 +            _ = try await AuthManager.shared.getAuthenticatedTeam()
 +            _ = try await AuthManager.shared.getAuthenticatedSession()
 +            try cancellation.check()
@@ -555,6 +581,67 @@ index 00000000..2e6def62
 +        report.cleanupAllowed = true
 +        progress.completedUnitCount = progress.totalUnitCount
 +        return report
++    }
++
++    /// Wait only for transport readiness, BEFORE any Apple session/profile
++    /// request. This does not retry authentication or a renewal operation.
++    private static func waitForNetworkReady(progress: Progress, cancellation: AutomationCancellation) async throws {
++        let started = ProcessInfo.processInfo.systemUptime
++        var attempt = 0
++        while AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: started, now: ProcessInfo.processInfo.systemUptime) {
++            try cancellation.check()
++            attempt += 1
++            progress.localizedAdditionalDescription = "Waiting for LocalDevVPN (\(attempt))"
++            // These are sequential awaits, not a timer racing the probe. Even
++            // cancellation waits for an in-flight native check to finish before
++            // this method returns. The 30s window stops new probes; draining
++            // an already-started native call may take additional time.
++            await minimuxer.network.refreshEndpoint()
++            try cancellation.check()
++            let result = await minimuxer.core.isReady(withNetworkCheck: true)
++            try cancellation.check()
++            guard AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: started, now: ProcessInfo.processInfo.systemUptime) else {
++                throw AutomationFailure("networkReadinessTimedOut")
++            }
++            switch result {
++            case .success(true):
++                return
++            case .success(false):
++                throw AutomationFailure("networkReadinessUnverified")
++            case .failure(let error):
++                let kind = readinessKind(error)
++                let remotePairing = minimuxer.gateway.pairingFileType == .rppairing
++                guard AutomationRefreshPolicy.mayRetryReadiness(kind, remotePairing: remotePairing) else {
++                    throw AutomationFailure(kind == .invalidPairing ? "pairingNotReady" : kind == .locked ? "deviceLocked" : "networkReadinessFailed")
++                }
++            }
++            let remaining = AutomationRefreshPolicy.networkReadyWindow - (ProcessInfo.processInfo.systemUptime - started)
++            guard remaining > 0 else { throw AutomationFailure("networkReadinessTimedOut") }
++            try await Task.sleep(nanoseconds: UInt64(min(0.5, remaining) * 1_000_000_000))
++        }
++        try cancellation.check()
++        throw AutomationFailure("networkReadinessTimedOut")
++    }
++
++    private static func readinessKind(_ error: MinimuxerError) -> AutomationRefreshPolicy.ReadinessFailure {
++        switch error {
++        case .invalidPairing, .pairingNotLoaded:
++            return .invalidPairing
++        case .noVPN(let reason):
++            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .missingTunnel
++        case .noConnection(let reason):
++            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .networkUnavailable
++        case .noDevice(let reason):
++            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .endpointNotReady
++        case .notReachable(let reason):
++            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .peerUnreachable
++        case .invalidVPN(let reason):
++            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .invalidVPN
++        default:
++            // Includes notStarted, unconfigured transport and native service
++            // errors: do not guess that a pairing/locked-device error is transient.
++            return .unknown
++        }
 +    }
 +
 +    private static func findTargets(context: NSManagedObjectContext) throws -> [AutomationTarget] {
@@ -671,10 +758,10 @@ index 00000000..887be4be
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshPolicy.swift b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
 new file mode 100644
-index 00000000..49a93bbb
+index 00000000..65347ced
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,158 @@
 +import Foundation
 +
 +/// The shortcut obtains a lease before changing VPNs and releases it only AFTER
@@ -775,6 +862,38 @@ index 00000000..49a93bbb
 +
 +enum AutomationRefreshPolicy {
 +    static let rustDeskID = "com.bearberni.rustdesk.v2"
++
++    enum ReadinessFailure: Sendable, Equatable {
++        case networkUnavailable, missingTunnel, endpointNotReady, peerUnreachable
++        case invalidVPN, invalidPairing, locked, unknown
++    }
++
++    static let networkReadyWindow: TimeInterval = 30
++
++    static func mayStartReadinessProbe(startedAt: TimeInterval, now: TimeInterval) -> Bool {
++        now >= startedAt && now - startedAt < networkReadyWindow
++    }
++
++    static func mayRetryReadiness(_ failure: ReadinessFailure, remotePairing: Bool) -> Bool {
++        switch failure {
++        case .networkUnavailable, .missingTunnel, .endpointNotReady, .peerUnreachable:
++            return true
++        case .invalidVPN:
++            // In the pinned core, RP uses invalidVPN for a failed peer TCP
++            // probe; lockdown also uses it for unsupported/missing IPsec.
++            return remotePairing
++        case .invalidPairing, .locked, .unknown:
++            return false
++        }
++    }
++
++    static func readinessReasonIsPermanent(_ reason: String) -> Bool {
++        let text = reason.lowercased()
++        // Conservative fail-fast override. These hints can NEVER authorize a
++        // retry; typed unknown errors below are also always non-retryable.
++        return ["pairing", "locked", "unlock", "passcode", "authentication", "denied"]
++            .contains { text.contains($0) }
++    }
 +
 +    /// Original ID must match exactly. A name/prefix match could select the
 +    /// App Store client or another RustDesk build and is deliberately rejected.
