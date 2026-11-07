@@ -1,0 +1,59 @@
+name: Build personal SideStore automation
+
+on:
+  push:
+    branches:
+      - sidestore-automation-no-menus
+    paths:
+      - sidestore-automation/personal-automation.patch
+  workflow_dispatch:
+    inputs:
+      xcode:
+        description: Xcode 27 SDK to select on the public xcode-27 runner
+        required: true
+        default: '27.2'
+        type: choice
+        options:
+          - '27.2'
+          - '27.1'
+      intent_identifier:
+        description: Swift AppIntent type expected in the compiled metadata
+        required: true
+        default: AutomationRefreshIntent
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidestore-personal-automation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      SIDESTORE_XCODE: ${{ inputs.xcode || '27.2' }}
+      SIDESTORE_INTENT_IDENTIFIER: ${{ inputs.intent_identifier || 'AutomationRefreshIntent' }}
+      SIDESTORE_INTENT_IDENTIFIERS: PrepareAutomationIntent,${{ inputs.intent_identifier || 'AutomationRefreshIntent' }},FinalizeAutomationIntent
+      SIDESTORE_PATCH_PATH: sidestore-automation/personal-automation.patch
+      SIDESTORE_ARTIFACT_DIR: ${{ github.workspace }}/sidestore-automation-artifact
+    steps:
+      - name: Checkout only the build recipe
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Build unsigned personal automation IPA
+        run: bash sidestore-automation/build_sidestore_automation.sh
+
+      - name: Upload IPA, metadata, manifest and complete logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: SideStore-personalautomation-${{ github.run_number }}
+          path: sidestore-automation-artifact/
+          if-no-files-found: error
+          retention-days: 7
