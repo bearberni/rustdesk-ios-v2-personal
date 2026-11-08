@@ -35,10 +35,10 @@ index 4f83be72..45968aea 100644
      {
 diff --git a/AutomationTests/AutomationRefreshPolicyTests.swift b/AutomationTests/AutomationRefreshPolicyTests.swift
 new file mode 100644
-index 00000000..626a580c
+index 00000000..6921a1e3
 --- /dev/null
 +++ b/AutomationTests/AutomationRefreshPolicyTests.swift
-@@ -0,0 +1,290 @@
+@@ -0,0 +1,339 @@
 +import XCTest
 +@testable import SideStoreAutomationPolicy
 +
@@ -51,6 +51,55 @@ index 00000000..626a580c
 +    private func strings(_ json: String) throws -> [String: String] {
 +        // This decoder rejects JSON booleans, numbers, arrays and nested objects.
 +        try JSONDecoder().decode([String: String].self, from: Data(json.utf8))
++    }
++
++    func testPinnedIdeviceDumpContractAcceptsOnlyOurNormalizedPrivateDirectory() {
++        let directory = URL(fileURLWithPath: "/private/automation-run/PROVISION", isDirectory: true)
++        XCTAssertEqual(AutomationRefreshPolicy.profileDumpLayout(returned: directory.path, expectedDirectory: directory), .uuidDirectory)
++        XCTAssertEqual(AutomationRefreshPolicy.profileDumpLayout(returned: directory.path + "/", expectedDirectory: directory), .uuidDirectory)
++        XCTAssertNil(AutomationRefreshPolicy.profileDumpLayout(returned: "/private/another-run/PROVISION", expectedDirectory: directory))
++        XCTAssertNil(AutomationRefreshPolicy.profileDumpLayout(returned: "/private/automation-run/PROVISION/../../outside", expectedDirectory: directory))
++        XCTAssertNil(AutomationRefreshPolicy.profileDumpLayout(returned: "dump succeeded", expectedDirectory: directory))
++    }
++
++    func testPinnedLibimobiledeviceRemotePairingDumpIsCountNotDirectory() {
++        let directory = URL(fileURLWithPath: "/private/automation-run/PROVISION", isDirectory: true)
++        let layout = AutomationRefreshPolicy.profileDumpLayout(returned: "Successfully dumped 2 profiles", expectedDirectory: directory)
++        XCTAssertEqual(layout, .indexedFiles(count: 2))
++        XCTAssertTrue(AutomationRefreshPolicy.profileDumpFileMatches("Profile_0.mobileprovision", layout: .indexedFiles(count: 2)))
++        XCTAssertTrue(AutomationRefreshPolicy.profileDumpFileMatches("Profile_1.mobileprovision", layout: .indexedFiles(count: 2)))
++        for name in ["Profile_2.mobileprovision", "Profile_-1.mobileprovision", "Profile_00.mobileprovision", "../Profile_0.mobileprovision", "Profile_0.plist"] {
++            XCTAssertFalse(AutomationRefreshPolicy.profileDumpFileMatches(name, layout: .indexedFiles(count: 2)))
++        }
++        for text in ["Successfully dumped -1 profiles", "Successfully dumped +2 profiles", "Successfully dumped 513 profiles", "Successfully dumped 2 profiles extra"] {
++            XCTAssertNil(AutomationRefreshPolicy.profileDumpLayout(returned: text, expectedDirectory: directory))
++        }
++    }
++
++    func testPinnedLibimobiledeviceLockdownDumpPreservesInlineProfileBytes() throws {
++        let directory = URL(fileURLWithPath: "/private/automation-run/PROVISION", isDirectory: true)
++        // Format fixtures, not fabricated CMS installation evidence. The real
++        // verifier must separately parse, UUID-match and hash every target.
++        let profiles = [Data([0x30, 0x82, 0x01, 0x00]), Data([0x30, 0x01, 0xFF])]
++        let xml = try PropertyListSerialization.data(fromPropertyList: profiles, format: .xml, options: 0)
++        XCTAssertEqual(AutomationRefreshPolicy.profileDumpLayout(returned: String(decoding: xml, as: UTF8.self), expectedDirectory: directory), .inlineProfiles(profiles))
++        let invalidPayloads: [Any] = [["not profile data"], ["ProfileArray": profiles]]
++        for invalid in invalidPayloads {
++            let bytes = try PropertyListSerialization.data(fromPropertyList: invalid, format: .xml, options: 0)
++            XCTAssertNil(AutomationRefreshPolicy.profileDumpLayout(returned: String(decoding: bytes, as: UTF8.self), expectedDirectory: directory))
++        }
++        let emptyProfile = try PropertyListSerialization.data(fromPropertyList: [Data()], format: .xml, options: 0)
++        XCTAssertNil(AutomationRefreshPolicy.profileDumpLayout(returned: String(decoding: emptyProfile, as: UTF8.self), expectedDirectory: directory))
++    }
++
++    func testDumpFilenameSpellingDoesNotDetermineProfileIdentity() {
++        let lowerUUID = "77b875e7-047c-4127-9e88-a7ba25bf8230"
++        XCTAssertEqual(UUID(uuidString: lowerUUID)?.uuidString, "77B875E7-047C-4127-9E88-A7BA25BF8230")
++        XCTAssertTrue(AutomationRefreshPolicy.profileDumpFileMatches(lowerUUID + ".mobileprovision", layout: .uuidDirectory))
++        XCTAssertTrue(AutomationRefreshPolicy.profileDumpFileMatches("unknown_0.mobileprovision", layout: .uuidDirectory))
++        XCTAssertFalse(AutomationRefreshPolicy.profileDumpFileMatches(lowerUUID + ".plist", layout: .uuidDirectory))
++        XCTAssertFalse(AutomationRefreshPolicy.profileDumpFileMatches("/outside/" + lowerUUID + ".mobileprovision", layout: .uuidDirectory))
++        XCTAssertFalse(AutomationRefreshPolicy.profileDumpFileMatches("Profile_0.mobileprovision", layout: .inlineProfiles([])))
 +    }
 +
 +    func testV2PrepareWireUsesOnlyStringsAndFixedStates() throws {
@@ -353,10 +402,10 @@ index 00000000..90e7cf7e
 +)
 diff --git a/SideStore/Core/Automation/AutomationProfileEvidence.swift b/SideStore/Core/Automation/AutomationProfileEvidence.swift
 new file mode 100644
-index 00000000..2f6df927
+index 00000000..943c255c
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationProfileEvidence.swift
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,162 @@
 +import Foundation
 +import CryptoKit
 +import SideSign
@@ -429,33 +478,89 @@ index 00000000..2f6df927
 +    func verifyInstalledOnDevice() async throws -> (profiles: [Profile], main: Profile) {
 +        let captured = try snapshot()
 +        let root = FileManager.default.temporaryDirectory.appendingPathComponent("AutomationProfileCheck-" + UUID().uuidString, isDirectory: true)
-+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
++        do { try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true) }
++        catch { throw AutomationFailure("profileReadbackDirectoryUnavailable") }
 +        defer { try? FileManager.default.removeItem(at: root) }
-+        let returned = try await dumpProfiles(root.path)
-+        let expectedDirectory = root.appendingPathComponent("PROVISION", isDirectory: true).standardizedFileURL
-+        guard URL(fileURLWithPath: returned).standardizedFileURL == expectedDirectory else {
-+            throw AutomationFailure("profileReadbackUnavailable")
-+        }
-+        for item in captured.profiles {
-+            // UUIDs are parsed by SideSign, never accepted as arbitrary paths.
-+            guard UUID(uuidString: item.uuid) != nil else { throw AutomationFailure("invalidProfileUUID") }
-+            let file = expectedDirectory.appendingPathComponent(item.uuid + ".mobileprovision")
-+            let attrs = try file.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey])
-+            guard attrs.isSymbolicLink != true, let size = attrs.fileSize, size > 0, size < 2_000_000 else {
-+                throw AutomationFailure("invalidProfileReadback")
-+            }
-+            let data = try Data(contentsOf: file)
-+            let actual = try ALTProvisioningProfile(data: data)
++        let returned: String
++        do { returned = try await dumpProfiles(root.path) }
++        catch { throw AutomationFailure("profileReadbackNativeFailed") }
++        let data = try readDump(returned: returned, root: root)
++        let expected = Dictionary(uniqueKeysWithValues: captured.profiles.map { ($0.uuid, $0) })
++        var found = Set<String>()
++        for bytes in data {
++            // copy_all includes unrelated system/app profiles. They are not
++            // evidence for our targets. Never match by filename or bundle prefix.
++            guard let actual = try? ALTProvisioningProfile(data: bytes),
++                  let item = expected[actual.uuid.uuidString] else { continue }
++            guard found.insert(item.uuid).inserted else { throw AutomationFailure("profileReadbackDuplicateUUID") }
++            guard Self.hash(bytes) == item.hash else { throw AutomationFailure("profileReadbackHashMismatch") }
 +            guard AutomationRefreshPolicy.verifiedProfile(
 +                expectedUUID: item.uuid, expectedHash: item.hash,
-+                actualUUID: actual.uuid.uuidString, actualHash: Self.hash(data),
++                actualUUID: actual.uuid.uuidString, actualHash: Self.hash(bytes),
 +                expectedBundleID: item.bundleID, actualBundleID: actual.bundleIdentifier,
 +                expectedTeamID: item.teamID, actualTeamID: actual.teamIdentifier,
 +                expiry: actual.expirationDate, now: Date()) else {
-+                throw AutomationFailure("deviceProfileMismatch")
++                throw AutomationFailure("profileReadbackIdentityMismatch")
 +            }
 +        }
++        guard found == Set(expected.keys) else { throw AutomationFailure("profileReadbackExpectedProfileMissing") }
 +        return captured
++    }
++
++    /// Pinned 98c3 contracts: idevice returns root/PROVISION and UUID-named
++    /// files; libimobiledevice RP returns a count string and Profile_N files in
++    /// root; libimobiledevice Lockdown returns an XML Data array. Every byte
++    /// still needs the exact expected UUID/hash/identity checks above.
++    private func readDump(returned: String, root: URL) throws -> [Data] {
++        let provisionDirectory = root.appendingPathComponent("PROVISION", isDirectory: true)
++        guard let layout = AutomationRefreshPolicy.profileDumpLayout(returned: returned, expectedDirectory: provisionDirectory) else {
++            throw AutomationFailure("profileReadbackFormatUnsupported")
++        }
++        let directory: URL
++        switch layout {
++        case .inlineProfiles(let profiles):
++            return profiles
++        case .uuidDirectory:
++            directory = provisionDirectory
++        case .indexedFiles:
++            directory = root
++        }
++        let entries: [URL]
++        do {
++            let attributes = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
++            guard attributes.isDirectory == true, attributes.isSymbolicLink != true else {
++                throw AutomationFailure("profileReadbackDirectoryInvalid")
++            }
++            entries = try FileManager.default.contentsOfDirectory(at: directory,
++                includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
++        } catch let error as AutomationFailure { throw error }
++        catch { throw AutomationFailure("profileReadbackDirectoryUnavailable") }
++        let files = entries.filter { AutomationRefreshPolicy.profileDumpFileMatches($0.lastPathComponent, layout: layout) }
++        guard files.count <= AutomationRefreshPolicy.maximumReadbackProfiles else { throw AutomationFailure("profileReadbackLimitExceeded") }
++        if case .indexedFiles(let count) = layout, files.count != count {
++            // The native backend uses try? when writing exports. A status string
++            // cannot hide missing files or replace actual device proof.
++            throw AutomationFailure("profileReadbackExportIncomplete")
++        }
++        guard !files.isEmpty else { throw AutomationFailure("profileReadbackExportEmpty") }
++        var result: [Data] = []
++        var total = 0
++        for file in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
++            do {
++                let attrs = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
++                guard attrs.isRegularFile == true, attrs.isSymbolicLink != true, let size = attrs.fileSize,
++                      size > 0, size < AutomationRefreshPolicy.maximumReadbackProfileBytes else {
++                    throw AutomationFailure("profileReadbackFileInvalid")
++                }
++                total += size
++                guard total <= AutomationRefreshPolicy.maximumReadbackTotalBytes else { throw AutomationFailure("profileReadbackLimitExceeded") }
++                let bytes = try Data(contentsOf: file)
++                guard bytes.count == size else { throw AutomationFailure("profileReadbackFileChanged") }
++                result.append(bytes)
++            } catch let error as AutomationFailure { throw error }
++            catch { throw AutomationFailure("profileReadbackFileUnavailable") }
++        }
++        return result
 +    }
 +}
 +
@@ -465,10 +570,10 @@ index 00000000..2f6df927
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshCoordinator.swift b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
 new file mode 100644
-index 00000000..933bc950
+index 00000000..0800dc3c
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,465 @@
 +import Foundation
 +import CryptoKit
 +@preconcurrency import CoreData
@@ -803,7 +908,8 @@ index 00000000..933bc950
 +                progress.localizedAdditionalDescription = "Verifying installed profiles"
 +                let proof: (profiles: [AutomationProfileEvidence.Profile], main: AutomationProfileEvidence.Profile)
 +                do { proof = try await evidence.verifyInstalledOnDevice() }
-+                catch { throw AutomationFailure("deviceProfileVerificationUnavailable") }
++                catch let failure as AutomationFailure { throw failure }
++                catch { throw AutomationFailure("profileReadbackUnexpectedFailure") }
 +                try cancellation.check()
 +                let appReport = AutomationAppReport(completed: true, bundleID: target.installedID,
 +                    expiresAt: AutomationRefreshPolicy.timestamp(proof.main.expires),
@@ -816,7 +922,7 @@ index 00000000..933bc950
 +            let code = (error as? AutomationFailure)?.code ?? "refreshFailedSeeSideStoreLog"
 +            if cancellation.isCancelled || error is CancellationError {
 +                report.outcome = .cancelled
-+            } else if ["deviceProfileVerificationUnavailable", "nativeInstallEvidenceMissing", "invalidCompletionCount", "emptyOrMismatchedResult"].contains(code) {
++            } else if code.hasPrefix("profileReadback") || ["deviceProfileVerificationUnavailable", "nativeInstallEvidenceMissing", "invalidCompletionCount", "emptyOrMismatchedResult"].contains(code) {
 +                report.outcome = .unverified
 +            } else { report.outcome = .failed }
 +            report.errors.append(.init(code: code, app: !report.rustdesk.completed ? "rustdesk" : "sidestore"))
@@ -1038,10 +1144,10 @@ index 00000000..8f8d2baa
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshPolicy.swift b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
 new file mode 100644
-index 00000000..52fe2d61
+index 00000000..7a948b23
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
-@@ -0,0 +1,277 @@
+@@ -0,0 +1,337 @@
 +import Foundation
 +
 +/// The shortcut obtains a lease before changing VPNs and releases it only AFTER
@@ -1238,8 +1344,68 @@ index 00000000..52fe2d61
 +    }
 +}
 +
++/// The pinned Minimuxer backends have three DIFFERENT dumpProfiles contracts.
++/// Recognizing a contract selects where to read; it is never installation proof.
++enum AutomationProfileDumpLayout: Sendable, Equatable {
++    case uuidDirectory
++    case indexedFiles(count: Int)
++    case inlineProfiles([Data])
++}
++
 +enum AutomationRefreshPolicy {
 +    static let rustDeskID = "com.bearberni.rustdesk.v2"
++    static let maximumReadbackProfiles = 512
++    static let maximumReadbackProfileBytes = 2_000_000
++    static let maximumReadbackTotalBytes = 32_000_000
++
++    static func profileDumpLayout(returned: String, expectedDirectory: URL) -> AutomationProfileDumpLayout? {
++        guard returned.utf8.count <= maximumReadbackTotalBytes else { return nil }
++        // IdeviceGateway: absolute private directory; compare normalized paths,
++        // not URL directory hints/trailing slashes. Never follow an outside path.
++        if returned.hasPrefix("/"),
++           URL(fileURLWithPath: returned).standardizedFileURL.path == expectedDirectory.standardizedFileURL.path {
++            return .uuidDirectory
++        }
++        // LibimobiledeviceGateway RP: files are in docsPath itself, and the
++        // returned string is a status message rather than a filesystem path.
++        let prefix = "Successfully dumped "
++        let suffix = " profiles"
++        if returned.hasPrefix(prefix), returned.hasSuffix(suffix) {
++            let digits = returned.dropFirst(prefix.count).dropLast(suffix.count)
++            guard !digits.isEmpty, digits.utf8.allSatisfy({ (48...57).contains($0) }),
++                  let count = Int(digits), count <= maximumReadbackProfiles else { return nil }
++            return .indexedFiles(count: count)
++        }
++        // LibimobiledeviceGateway Lockdown: XML plist array of CMS profile Data;
++        // nothing is written to disk. Do not accept arbitrary text/XML objects.
++        guard returned.hasPrefix("<?xml"),
++              let profiles = try? PropertyListSerialization.propertyList(from: Data(returned.utf8), options: [], format: nil) as? [Data],
++              profiles.count <= maximumReadbackProfiles else { return nil }
++        var total = 0
++        for data in profiles {
++            guard !data.isEmpty, data.count < maximumReadbackProfileBytes else { return nil }
++            total += data.count
++            guard total <= maximumReadbackTotalBytes else { return nil }
++        }
++        return .inlineProfiles(profiles)
++    }
++
++    static func profileDumpFileMatches(_ name: String, layout: AutomationProfileDumpLayout) -> Bool {
++        guard !name.contains("/"), !name.contains("\\"), name.hasSuffix(".mobileprovision") else { return false }
++        switch layout {
++        case .uuidDirectory:
++            // The inner UUID's original spelling/case determines the upstream
++            // filename. Match the parsed profile UUID, never this filename.
++            return true
++        case .indexedFiles(let count):
++            guard name.hasPrefix("Profile_") else { return false }
++            let digits = name.dropFirst("Profile_".count).dropLast(".mobileprovision".count)
++            guard let index = Int(digits), index >= 0, index < count, String(index) == digits else { return false }
++            return true
++        case .inlineProfiles:
++            return false
++        }
++    }
 +
 +    static func isPristinePrepared(_ lease: AutomationLease) -> Bool {
 +        let report = lease.report
