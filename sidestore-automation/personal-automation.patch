@@ -35,14 +35,172 @@ index 4f83be72..45968aea 100644
      {
 diff --git a/AutomationTests/AutomationRefreshPolicyTests.swift b/AutomationTests/AutomationRefreshPolicyTests.swift
 new file mode 100644
-index 00000000..08d0acf2
+index 00000000..626a580c
 --- /dev/null
 +++ b/AutomationTests/AutomationRefreshPolicyTests.swift
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,290 @@
 +import XCTest
 +@testable import SideStoreAutomationPolicy
 +
 +final class AutomationRefreshPolicyTests: XCTestCase {
++    private func preparedLease() -> AutomationLease {
++        let id = "77B875E7-047C-4127-9E88-A7BA25BF8230"
++        return .init(runID: id, phase: .prepared, report: .init(runID: id))
++    }
++
++    private func strings(_ json: String) throws -> [String: String] {
++        // This decoder rejects JSON booleans, numbers, arrays and nested objects.
++        try JSONDecoder().decode([String: String].self, from: Data(json.utf8))
++    }
++
++    func testV2PrepareWireUsesOnlyStringsAndFixedStates() throws {
++        let cases: [(AutomationPrepareReport, String)] = [
++            (.init(ready: true, runID: "ticket", outcome: "ready"), "ready"),
++            (.init(ready: false, runID: "ticket", outcome: "busy"), "busy"),
++            (.init(ready: false, runID: "ticket", outcome: "interrupted"), "interrupted"),
++            (.init(ready: false, runID: "", outcome: "unverified", errors: [.init(code: "journalUnavailable", app: nil)]), "storageError")
++        ]
++        for (report, expected) in cases {
++            let value = try strings(AutomationPrepareV2Report(report: report, phase: "prepared").json)
++            XCTAssertEqual(Set(value.keys), ["protocol", "state", "runID", "phase", "recoveryState", "errorCode"])
++            XCTAssertEqual(value["protocol"], "sidestore-personal-renewal/2")
++            XCTAssertEqual(value["state"], expected)
++            XCTAssertEqual(value["runID"], report.runID)
++            XCTAssertEqual(value["recoveryState"], "none")
++        }
++    }
++
++    func testV2ExecutionWireCannotGrantCleanupFromNonterminalReport() throws {
++        var report = AutomationRefreshReport(runID: "ticket")
++        report.cleanupAllowed = true // Inconsistent legacy data must fail closed.
++        var value = try strings(AutomationExecuteV2Report(report: report).json)
++        XCTAssertEqual(value["completionState"], "nonterminal")
++        XCTAssertEqual(value["cleanupState"], "blocked")
++        XCTAssertEqual(value["rustdeskState"], "notCompleted")
++        report.terminal = true
++        report.outcome = .success
++        report.rustdesk.completed = true
++        report.sidestore.completed = true
++        value = try strings(AutomationExecuteV2Report(report: report).json)
++        XCTAssertEqual(Set(value.keys), ["protocol", "runID", "completionState", "cleanupState", "outcome", "rustdeskState", "sidestoreState", "errorCode"])
++        XCTAssertEqual(value["protocol"], "sidestore-personal-renewal/2")
++        XCTAssertEqual(value["completionState"], "terminal")
++        XCTAssertEqual(value["cleanupState"], "allowed")
++        XCTAssertEqual(value["outcome"], "success")
++        XCTAssertEqual(value["rustdeskState"], "completed")
++        XCTAssertEqual(value["sidestoreState"], "completed")
++    }
++
++    func testV2FinalizeAndDisabledLegacyWireAreStringOnlyAndFailClosed() throws {
++        let blocked = AutomationFinalizeReport(runID: "ticket", finalized: true, released: false, outcome: "invalidTicket")
++        XCTAssertEqual(try strings(AutomationFinalizeV2Report(report: blocked).json)["finalizationState"], "blocked")
++        let done = AutomationFinalizeReport(runID: "ticket", finalized: true, released: true, outcome: "finalized")
++        let final = try strings(AutomationFinalizeV2Report(report: done).json)
++        XCTAssertEqual(final["protocol"], "sidestore-personal-renewal/2")
++        XCTAssertEqual(final["finalizationState"], "finalized")
++        let legacy = try strings(AutomationRenewalWireV2.clientUpdateRequired)
++        XCTAssertEqual(legacy["state"], "clientUpdateRequired")
++        XCTAssertEqual(legacy["completionState"], "nonterminal")
++        XCTAssertEqual(legacy["cleanupState"], "blocked")
++        XCTAssertEqual(legacy["finalizationState"], "blocked")
++        XCTAssertNil(legacy["ready"])
++    }
++
++    func testOriginalV1PreparedJournalStillDecodesWithoutMigration() throws {
++        let fixture = """
++        {"runID":"77B875E7-047C-4127-9E88-A7BA25BF8230","phase":"prepared","report":{"schemaVersion":1,"runID":"77B875E7-047C-4127-9E88-A7BA25BF8230","terminal":false,"cleanupAllowed":false,"outcome":"unverified","rustdesk":{"completed":false,"bundleID":"com.bearberni.rustdesk.v2","installedProfileUUIDs":[]},"sidestore":{"completed":false,"bundleID":"","installedProfileUUIDs":[]},"errors":[]}}
++        """
++        let decoded = try JSONDecoder().decode(AutomationLease.self, from: Data(fixture.utf8))
++        XCTAssertEqual(decoded, preparedLease())
++        XCTAssertNotNil(AutomationColdPreparedEvidence(diskLease: decoded, diskSHA256: "originalHash"))
++    }
++
++    func testOnlyProvenColdPreparedJournalCanRecover() throws {
++        let disk = preparedLease()
++        let evidence = try XCTUnwrap(AutomationColdPreparedEvidence(diskLease: disk, diskSHA256: "originalHash"))
++        var loaded = disk
++        loaded.markProcessInterrupted()
++        XCTAssertTrue(evidence.permitsRecovery(current: loaded, disk: disk, diskSHA256: "originalHash", hasWorker: false, hasCancellation: false))
++        // A newly acquired ticket in this same process must never be stolen.
++        XCTAssertFalse(evidence.permitsRecovery(current: disk, disk: disk, diskSHA256: "originalHash", hasWorker: false, hasCancellation: false))
++        XCTAssertFalse(evidence.permitsRecovery(current: loaded, disk: disk, diskSHA256: "changedHash", hasWorker: false, hasCancellation: false))
++        XCTAssertFalse(evidence.permitsRecovery(current: loaded, disk: disk, diskSHA256: "originalHash", hasWorker: true, hasCancellation: false))
++        XCTAssertFalse(evidence.permitsRecovery(current: loaded, disk: disk, diskSHA256: "originalHash", hasWorker: false, hasCancellation: true))
++        loaded.runID = UUID().uuidString
++        XCTAssertFalse(evidence.permitsRecovery(current: loaded, disk: disk, diskSHA256: "originalHash", hasWorker: false, hasCancellation: false))
++    }
++
++    func testRunningCleanupInterruptedAndUnknownDiskStateCannotBecomeRecoveryEvidence() throws {
++        for phase in [AutomationLease.Phase.running, .awaitingCleanup, .interrupted, .finalized] {
++            var disk = preparedLease()
++            disk.phase = phase
++            XCTAssertNil(AutomationColdPreparedEvidence(diskLease: disk, diskSHA256: "originalHash"))
++        }
++        let data = try JSONEncoder().encode(preparedLease())
++        let unknown = String(decoding: data, as: UTF8.self).replacingOccurrences(of: "\"prepared\"", with: "\"unknown\"")
++        XCTAssertThrowsError(try JSONDecoder().decode(AutomationLease.self, from: Data(unknown.utf8)))
++    }
++
++    func testPreparedJournalWithIdentityOrCompletionEvidenceCannotRecover() {
++        let corruptions: [(inout AutomationLease) -> Void] = [
++            { $0.runID = "not-a-uuid"; $0.report.runID = "not-a-uuid" },
++            { $0.report.runID = UUID().uuidString },
++            { $0.report.terminal = true },
++            { $0.report.cleanupAllowed = true },
++            { $0.report.rustdesk.completed = true },
++            { $0.report.sidestore.completed = true },
++            { $0.report.rustdesk.installedProfileUUIDs = [UUID().uuidString] },
++            { $0.report.sidestore.installedProfileUUIDs = [UUID().uuidString] },
++            { $0.report.rustdesk.expiresAt = "2030-01-01T00:00:00Z" },
++            { $0.report.outcome = .success },
++            { $0.report.errors = [.init(code: "unexpected", app: nil)] }
++        ]
++        for corrupt in corruptions {
++            var disk = preparedLease()
++            corrupt(&disk)
++            XCTAssertNil(AutomationColdPreparedEvidence(diskLease: disk, diskSHA256: "originalHash"))
++        }
++    }
++
++    func testRecoveryRechecksDiskLeaseNotJustCapturedPhase() throws {
++        let original = preparedLease()
++        let evidence = try XCTUnwrap(AutomationColdPreparedEvidence(diskLease: original, diskSHA256: "originalHash"))
++        var loaded = original
++        loaded.markProcessInterrupted()
++        var changed = original
++        changed.phase = .running
++        XCTAssertFalse(evidence.permitsRecovery(current: loaded, disk: changed, diskSHA256: "originalHash", hasWorker: false, hasCancellation: false))
++        changed = original
++        changed.runID = UUID().uuidString
++        changed.report.runID = changed.runID
++        XCTAssertFalse(evidence.permitsRecovery(current: loaded, disk: changed, diskSHA256: "originalHash", hasWorker: false, hasCancellation: false))
++    }
++
++    func testWorkerStartRequiresSuccessfulRunningJournalWrite() throws {
++        enum WriteFailure: Error { case denied }
++        let prepared = preparedLease()
++        var workerStarts = 0
++        var writeCalls = 0
++        do {
++            if try AutomationRefreshPolicy.commitRunningLease(prepared, runID: prepared.runID, persist: { lease in
++                writeCalls += 1
++                XCTAssertEqual(lease.phase, .running)
++                throw WriteFailure.denied
++            }) != nil { workerStarts += 1 }
++            XCTFail("A failed journal write must throw before the worker permit is returned")
++        } catch WriteFailure.denied { } catch { XCTFail("Unexpected error: \(error)") }
++        XCTAssertEqual(writeCalls, 1)
++        XCTAssertEqual(workerStarts, 0)
++        XCTAssertEqual(prepared.phase, .prepared)
++        var persisted: AutomationLease?
++        let permit = try AutomationRefreshPolicy.commitRunningLease(prepared, runID: prepared.runID) { persisted = $0 }
++        if permit != nil { workerStarts += 1 }
++        XCTAssertEqual(persisted?.phase, .running)
++        XCTAssertEqual(permit, persisted)
++        XCTAssertEqual(workerStarts, 1)
++        XCTAssertNil(try AutomationRefreshPolicy.commitRunningLease(prepared, runID: "stale") { _ in XCTFail("Stale token must not write") })
++    }
++
 +    func testReadinessRetriesOnlyNetworkSetupFailures() {
 +        for failure in [AutomationRefreshPolicy.ReadinessFailure.networkUnavailable, .missingTunnel, .endpointNotReady, .peerUnreachable] {
 +            XCTAssertTrue(AutomationRefreshPolicy.mayRetryReadiness(failure, remotePairing: true))
@@ -307,11 +465,12 @@ index 00000000..2f6df927
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshCoordinator.swift b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
 new file mode 100644
-index 00000000..d5df6eba
+index 00000000..933bc950
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
-@@ -0,0 +1,376 @@
+@@ -0,0 +1,464 @@
 +import Foundation
++import CryptoKit
 +@preconcurrency import CoreData
 +import SideSign
 +import Minimuxer
@@ -360,6 +519,7 @@ index 00000000..d5df6eba
 +    private var worker: Task<AutomationRefreshReport, Never>?
 +    private var cancellation: AutomationCancellation?
 +    private var storageFailed = false
++    private var coldPreparedEvidence: AutomationColdPreparedEvidence?
 +    private let journalURL: URL
 +
 +    init() {
@@ -371,6 +531,7 @@ index 00000000..d5df6eba
 +                let bytes = try Data(contentsOf: journalURL)
 +                guard bytes.count < 256_000 else { throw AutomationFailure("invalidJournal") }
 +                var previous = try JSONDecoder().decode(AutomationLease.self, from: bytes)
++                coldPreparedEvidence = AutomationColdPreparedEvidence(diskLease: previous, diskSHA256: Self.journalHash(bytes))
 +                previous.markProcessInterrupted()
 +                lease = previous
 +            } catch { storageFailed = true }
@@ -378,27 +539,91 @@ index 00000000..d5df6eba
 +    }
 +
 +    private func persist() throws {
++        guard let lease else { throw AutomationFailure("missingJournalLease") }
++        try persist(lease)
++    }
++
++    private func persist(_ value: AutomationLease) throws {
 +        try FileManager.default.createDirectory(at: journalURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-+        let data = try JSONEncoder().encode(lease)
++        let data = try JSONEncoder().encode(value)
 +        try data.write(to: journalURL, options: .atomic)
 +    }
 +
-+    func prepare() -> AutomationPrepareReport {
++    private static func journalHash(_ bytes: Data) -> String {
++        SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
++    }
++
++    /// Only V2 may acquire a ticket. A same-process fresh prepared lease is
++    /// busy. Cold recovery requires the original prepared disk evidence and
++    /// never follows merely from interrupted/worker==nil.
++    func prepareV2() -> AutomationPrepareV2Report {
 +        guard !storageFailed else {
-+            return .init(ready: false, runID: "", outcome: "unverified", errors: [.init(code: "journalUnavailable", app: nil)])
++            return storageErrorV2("journalUnavailable")
 +        }
 +        if let current = lease, current.phase != .finalized {
-+            return .init(ready: false, runID: current.runID,
-+                         outcome: current.phase == .interrupted ? "interrupted" : "busy")
++            if let evidence = coldPreparedEvidence, current.phase == .interrupted,
++               current.runID == evidence.runID, worker == nil, cancellation == nil {
++                let id = UUID().uuidString
++                let prepared = AutomationLease(runID: id, phase: .prepared, report: .init(runID: id))
++                do {
++                    try recoverColdPrepared(evidence: evidence, current: current, replacement: prepared)
++                    lease = prepared
++                    coldPreparedEvidence = nil
++                    return .init(report: .init(ready: true, runID: prepared.runID, outcome: "ready"),
++                                 phase: "prepared", recoveryState: "abandonedBeforeExecution")
++                } catch {
++                    storageFailed = true
++                    return storageErrorV2((error as? AutomationFailure)?.code ?? "preparedRecoveryStorageFailed")
++                }
++            }
++            return .init(report: .init(ready: false, runID: current.runID,
++                                      outcome: current.phase == .interrupted ? "interrupted" : "busy"),
++                         phase: current.phase.rawValue, recoveryState: "blocked")
 +        }
 +        let id = UUID().uuidString
-+        lease = .init(runID: id, phase: .prepared, report: .init(runID: id))
-+        do { try persist() }
++        let prepared = AutomationLease(runID: id, phase: .prepared, report: .init(runID: id))
++        do { try persist(prepared) }
 +        catch {
 +            storageFailed = true
-+            return .init(ready: false, runID: id, outcome: "unverified", errors: [.init(code: "journalUnavailable", app: nil)])
++            return storageErrorV2("journalUnavailable")
 +        }
-+        return .init(ready: true, runID: id, outcome: "ready")
++        lease = prepared
++        coldPreparedEvidence = nil
++        return .init(report: .init(ready: true, runID: id, outcome: "ready"), phase: "prepared")
++    }
++
++    private func storageErrorV2(_ code: String) -> AutomationPrepareV2Report {
++        .init(report: .init(ready: false, runID: lease?.runID ?? "", outcome: "unverified",
++                            errors: [.init(code: code, app: nil)]),
++              phase: lease?.phase.rawValue ?? "unknown", recoveryState: "blocked")
++    }
++
++    /// Synchronous actor-owned transaction: no await can interleave another
++    /// Prepare/Execute between validation, backup and durable replacement.
++    /// A backup/receipt/read/write failure preserves the old in-memory ticket
++    /// and blocks further work. No worker is created anywhere in this method.
++    private func recoverColdPrepared(evidence: AutomationColdPreparedEvidence, current: AutomationLease,
++                                     replacement: AutomationLease) throws {
++        let bytes = try Data(contentsOf: journalURL)
++        guard bytes.count < 256_000 else { throw AutomationFailure("invalidJournal") }
++        let disk = try JSONDecoder().decode(AutomationLease.self, from: bytes)
++        guard evidence.permitsRecovery(current: current, disk: disk, diskSHA256: Self.journalHash(bytes),
++                                       hasWorker: worker != nil, hasCancellation: cancellation != nil) else {
++            throw AutomationFailure("preparedRecoveryEvidenceChanged")
++        }
++        let directory = journalURL.deletingLastPathComponent().appendingPathComponent("PreparedRecovery", isDirectory: true)
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        let name = UUID().uuidString
++        let backupURL = directory.appendingPathComponent(name + ".original.json")
++        try bytes.write(to: backupURL, options: .withoutOverwriting)
++        guard try Data(contentsOf: backupURL) == bytes else { throw AutomationFailure("preparedRecoveryBackupFailed") }
++        let receipt = PreparedRecoveryReceipt(event: "abandonedBeforeExecution", originalRunID: disk.runID,
++            replacementRunID: replacement.runID, originalSHA256: evidence.diskSHA256,
++            backupFileName: backupURL.lastPathComponent, recordedAt: AutomationRefreshPolicy.timestamp(Date()))
++        try JSONEncoder().encode(receipt).write(to: directory.appendingPathComponent(name + ".receipt.json"), options: .withoutOverwriting)
++        // Check again after recording the backup, before overwriting anything.
++        guard try Data(contentsOf: journalURL) == bytes else { throw AutomationFailure("preparedRecoveryEvidenceChanged") }
++        try persist(replacement)
 +    }
 +
 +    /// For a legitimate Prepare ticket this method never returns while its
@@ -410,9 +635,17 @@ index 00000000..d5df6eba
 +        if current.phase == .running, let existing = worker { return await existing.value }
 +        guard current.canExecute(runID), !storageFailed else { return invalidTicket(runID) }
 +
-+        lease?.phase = .running
-+        do { try persist() }
-+        catch { return finishWithoutWorker(runID, outcome: .unverified, code: "journalUnavailable") }
++        do {
++            guard let running = try AutomationRefreshPolicy.commitRunningLease(current, runID: runID, persist: { try persist($0) }) else {
++                return invalidTicket(runID)
++            }
++            lease = running
++        } catch {
++            storageFailed = true
++            return finishWithoutWorker(runID, outcome: .unverified, code: "journalUnavailable")
++        }
++        // A durable running lease is a prerequisite, never a post-start log.
++        coldPreparedEvidence = nil
 +        cancellation = requestedCancellation
 +        let task = Task.detached {
 +            await AutomationRefreshWorker.run(runID: runID, progress: progress, cancellation: requestedCancellation)
@@ -468,18 +701,22 @@ index 00000000..d5df6eba
 +        return report
 +    }
 +
-+    func finalize(runID: String) -> String {
++    func finalizeV2(runID: String) -> AutomationFinalizeV2Report {
++        .init(report: finalizeReport(runID: runID))
++    }
++
++    private func finalizeReport(runID: String) -> AutomationFinalizeReport {
 +        guard let current = lease, current.canFinalize(runID), worker == nil else {
-+            return AutomationFinalizeReport(runID: runID, finalized: false, released: false, outcome: "invalidTicket").json
++            return AutomationFinalizeReport(runID: runID, finalized: false, released: false, outcome: "invalidTicket")
 +        }
 +        lease?.phase = .finalized
 +        do { try persist() }
 +        catch {
 +            lease?.phase = .awaitingCleanup
 +            storageFailed = true
-+            return AutomationFinalizeReport(runID: runID, finalized: false, released: false, outcome: "journalUnavailable").json
++            return AutomationFinalizeReport(runID: runID, finalized: false, released: false, outcome: "journalUnavailable")
 +        }
-+        return AutomationFinalizeReport(runID: runID, finalized: true, released: true, outcome: "finalized").json
++        return AutomationFinalizeReport(runID: runID, finalized: true, released: true, outcome: "finalized")
 +    }
 +
 +    func status() -> AutomationRefreshReport {
@@ -492,6 +729,15 @@ index 00000000..d5df6eba
 +        // Never grant a stale/invalid caller permission to change another run's VPN.
 +        return report
 +    }
++}
++
++private struct PreparedRecoveryReceipt: Codable {
++    let event: String
++    let originalRunID: String
++    let replacementRunID: String
++    let originalSHA256: String
++    let backupFileName: String
++    let recordedAt: String
 +}
 +
 +private struct AutomationTarget: @unchecked Sendable {
@@ -689,30 +935,64 @@ index 00000000..d5df6eba
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshIntent.swift b/SideStore/Core/Automation/AutomationRefreshIntent.swift
 new file mode 100644
-index 00000000..887be4be
+index 00000000..8f8d2baa
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshIntent.swift
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,97 @@
 +import AppIntents
 +import Foundation
 +
 +@available(iOS 27.0, *)
 +struct PrepareAutomationIntent: AppIntent {
-+    static var title: LocalizedStringResource = "Prepare Automatic Renewal"
-+    static var description = IntentDescription("Reserve a renewal run before changing VPNs. A busy result must not change the network.")
++    static var title: LocalizedStringResource = "Legacy Prepare Renewal (Update Shortcut)"
++    static var description = IntentDescription("Disabled legacy action. Use Prepare Automatic Renewal V2; this action never acquires a ticket.")
 +    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
 +
 +    func perform() async throws -> some IntentResult & ReturnsValue<String> {
-+        .result(value: await AutomationRefreshCoordinator.shared.prepare().json)
++        .result(value: AutomationRenewalWireV2.clientUpdateRequired)
 +    }
 +}
 +
 +@available(iOS 27.0, *)
-+struct AutomationRefreshIntent: LongRunningIntent, CancellableIntent {
-+    static var title: LocalizedStringResource = "Renew RustDesk V2 and SideStore"
-+    static var description = IntentDescription("Wait for sequential profile renewal and device verification; return a terminal JSON result, including ordinary failures.")
++struct AutomationRefreshIntent: AppIntent {
++    static var title: LocalizedStringResource = "Legacy Execute Renewal (Update Shortcut)"
++    static var description = IntentDescription("Disabled legacy action. This action never starts or cancels a renewal.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
++    @Parameter(title: "Run ID") var runID: String
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        .result(value: AutomationRenewalWireV2.clientUpdateRequired)
++    }
++}
++
++@available(iOS 27.0, *)
++struct FinalizeAutomationIntent: AppIntent {
++    static var title: LocalizedStringResource = "Legacy Finalize Renewal (Update Shortcut)"
++    static var description = IntentDescription("Disabled legacy action. This action never releases a renewal ticket.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
++    @Parameter(title: "Run ID") var runID: String
++
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        .result(value: AutomationRenewalWireV2.clientUpdateRequired)
++    }
++}
++
++@available(iOS 27.0, *)
++struct PrepareRenewalV2Intent: AppIntent {
++    static var title: LocalizedStringResource = "Prepare Automatic Renewal V2"
++    static var description = IntentDescription("Reserve a task before changing VPNs; return string-only protocol sidestore-personal-renewal/2.")
 +    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
 +
++    func perform() async throws -> some IntentResult & ReturnsValue<String> {
++        .result(value: await AutomationRefreshCoordinator.shared.prepareV2().json)
++    }
++}
++
++@available(iOS 27.0, *)
++struct ExecuteRenewalV2Intent: LongRunningIntent, CancellableIntent {
++    static var title: LocalizedStringResource = "Renew RustDesk V2 and SideStore V2"
++    static var description = IntentDescription("Wait for native renewal and device verification. Return string-only terminal and cleanup states, including ordinary failures.")
++    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
 +    @Parameter(title: "Run ID") var runID: String
 +
 +    func perform() async throws -> some IntentResult & ReturnsValue<String> {
@@ -730,19 +1010,19 @@ index 00000000..887be4be
 +            // termination cannot run this code; the journal keeps that distinct.
 +            report = await AutomationRefreshCoordinator.shared.cancelAndDrain(runID: runID, cancellation: cancellation)
 +        }
-+        return .result(value: report.json)
++        return .result(value: AutomationExecuteV2Report(report: report).json)
 +    }
 +}
 +
 +@available(iOS 27.0, *)
-+struct FinalizeAutomationIntent: AppIntent {
-+    static var title: LocalizedStringResource = "Finish Renewal Network Recovery"
-+    static var description = IntentDescription("Release the matching run only after the shortcut has restored its VPN configuration.")
++struct FinalizeRenewalV2Intent: AppIntent {
++    static var title: LocalizedStringResource = "Finish Renewal Network Recovery V2"
++    static var description = IntentDescription("Release the matching ticket only after VPN recovery; return a string-only finalization state.")
 +    static var allowedExecutionTargets: IntentExecutionTargets { [.main] }
 +    @Parameter(title: "Run ID") var runID: String
 +
 +    func perform() async throws -> some IntentResult & ReturnsValue<String> {
-+        .result(value: await AutomationRefreshCoordinator.shared.finalize(runID: runID))
++        .result(value: await AutomationRefreshCoordinator.shared.finalizeV2(runID: runID).json)
 +    }
 +}
 +
@@ -758,10 +1038,10 @@ index 00000000..887be4be
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshPolicy.swift b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
 new file mode 100644
-index 00000000..65347ced
+index 00000000..52fe2d61
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
-@@ -0,0 +1,158 @@
+@@ -0,0 +1,277 @@
 +import Foundation
 +
 +/// The shortcut obtains a lease before changing VPNs and releases it only AFTER
@@ -860,8 +1140,127 @@ index 00000000..65347ced
 +    }
 +}
 +
++/// Wire V2 deliberately has STRING VALUES ONLY. Shortcuts must compare these
++/// literals directly, never bridge JSON CFBoolean/NSNumber through Text.
++enum AutomationRenewalWireV2 {
++    static let protocolID = "sidestore-personal-renewal/2"
++
++    static func json<T: Encodable>(_ value: T) -> String {
++        let encoder = JSONEncoder()
++        encoder.outputFormatting = [.sortedKeys]
++        guard let data = try? encoder.encode(value), let result = String(data: data, encoding: .utf8) else {
++            return "{\"protocol\":\"sidestore-personal-renewal/2\",\"state\":\"storageError\",\"completionState\":\"nonterminal\",\"cleanupState\":\"blocked\",\"finalizationState\":\"blocked\",\"errorCode\":\"encodingFailed\"}"
++        }
++        return result
++    }
++
++    // Old action IDs stay discoverable so an installed old shortcut gets a
++    // fail-closed response, without acquiring, executing or releasing a lease.
++    static let clientUpdateRequired = "{\"protocol\":\"sidestore-personal-renewal/2\",\"state\":\"clientUpdateRequired\",\"completionState\":\"nonterminal\",\"cleanupState\":\"blocked\",\"finalizationState\":\"blocked\",\"errorCode\":\"clientUpdateRequired\",\"runID\":\"\"}"
++}
++
++struct AutomationPrepareV2Report: Codable, Sendable, Equatable {
++    var `protocol` = AutomationRenewalWireV2.protocolID
++    var state: String
++    var runID: String
++    var phase: String
++    var recoveryState: String
++    var errorCode: String
++
++    init(report: AutomationPrepareReport, phase: String, recoveryState: String = "none") {
++        state = report.ready ? "ready" : report.outcome == "busy" ? "busy" : report.outcome == "interrupted" ? "interrupted" : "storageError"
++        runID = report.runID
++        self.phase = phase
++        self.recoveryState = recoveryState
++        errorCode = report.errors.first?.code ?? "none"
++    }
++
++    var json: String { AutomationRenewalWireV2.json(self) }
++}
++
++struct AutomationExecuteV2Report: Codable, Sendable, Equatable {
++    var `protocol` = AutomationRenewalWireV2.protocolID
++    var runID: String
++    var completionState: String
++    var cleanupState: String
++    var outcome: String
++    var rustdeskState: String
++    var sidestoreState: String
++    var errorCode: String
++
++    init(report: AutomationRefreshReport) {
++        runID = report.runID
++        completionState = report.terminal ? "terminal" : "nonterminal"
++        cleanupState = report.canCleanup ? "allowed" : "blocked"
++        outcome = report.outcome.rawValue
++        rustdeskState = report.rustdesk.completed ? "completed" : "notCompleted"
++        sidestoreState = report.sidestore.completed ? "completed" : "notCompleted"
++        errorCode = report.errors.first?.code ?? "none"
++    }
++
++    var json: String { AutomationRenewalWireV2.json(self) }
++}
++
++struct AutomationFinalizeV2Report: Codable, Sendable, Equatable {
++    var `protocol` = AutomationRenewalWireV2.protocolID
++    var runID: String
++    var finalizationState: String
++    var errorCode: String
++
++    init(report: AutomationFinalizeReport) {
++        runID = report.runID
++        finalizationState = report.finalized && report.released ? "finalized" : "blocked"
++        errorCode = report.finalized && report.released ? "none" : report.outcome
++    }
++
++    var json: String { AutomationRenewalWireV2.json(self) }
++}
++
++/// Captured ONLY while loading the untouched journal in a new process. This
++/// evidence is not inferred from an in-memory .interrupted phase or worker=nil.
++struct AutomationColdPreparedEvidence: Sendable, Equatable {
++    let runID: String
++    let diskSHA256: String
++
++    init?(diskLease: AutomationLease, diskSHA256: String) {
++        guard AutomationRefreshPolicy.isPristinePrepared(diskLease), !diskSHA256.isEmpty else { return nil }
++        runID = diskLease.runID
++        self.diskSHA256 = diskSHA256
++    }
++
++    func permitsRecovery(current: AutomationLease, disk: AutomationLease, diskSHA256: String,
++                         hasWorker: Bool, hasCancellation: Bool) -> Bool {
++        guard !hasWorker, !hasCancellation, self.diskSHA256 == diskSHA256,
++              runID == disk.runID, AutomationRefreshPolicy.isPristinePrepared(disk) else { return false }
++        var expected = disk
++        expected.markProcessInterrupted()
++        return current == expected
++    }
++}
++
 +enum AutomationRefreshPolicy {
 +    static let rustDeskID = "com.bearberni.rustdesk.v2"
++
++    static func isPristinePrepared(_ lease: AutomationLease) -> Bool {
++        let report = lease.report
++        return UUID(uuidString: lease.runID) != nil && lease.runID == report.runID &&
++            lease.phase == .prepared && report.schemaVersion == 1 &&
++            !report.terminal && !report.cleanupAllowed && report.outcome == .unverified && report.errors.isEmpty &&
++            !report.rustdesk.completed && !report.sidestore.completed &&
++            report.rustdesk.installedProfileUUIDs.isEmpty && report.sidestore.installedProfileUUIDs.isEmpty &&
++            report.rustdesk.expiresAt == nil && report.sidestore.expiresAt == nil
++    }
++
++    /// The caller may start a backend ONLY after this returns a running lease.
++    /// A throwing durable write yields no permit and must never start a worker.
++    static func commitRunningLease(_ lease: AutomationLease, runID: String,
++                                   persist: (AutomationLease) throws -> Void) throws -> AutomationLease? {
++        guard lease.canExecute(runID), lease.runID == lease.report.runID else { return nil }
++        var running = lease
++        running.phase = .running
++        try persist(running)
++        return running
++    }
 +
 +    enum ReadinessFailure: Sendable, Equatable {
 +        case networkUnavailable, missingTunnel, endpointNotReady, peerUnreachable
