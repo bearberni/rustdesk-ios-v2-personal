@@ -8,12 +8,20 @@ MINIMUXER_REF=98c3c79982f813878e922ab42f9545314a700f0c
 recipe_root="${GITHUB_WORKSPACE:-$(pwd)}"
 artifact_dir="${SIDESTORE_ARTIFACT_DIR:-$recipe_root/sidestore-automation-artifact}"
 patch_path="${SIDESTORE_PATCH_PATH:-sidestore-automation/personal-automation.patch}"
-intent_identifier="${SIDESTORE_INTENT_IDENTIFIER:-AutomationRefreshIntent}"
-intent_identifiers="${SIDESTORE_INTENT_IDENTIFIERS:-PrepareAutomationIntent,$intent_identifier,FinalizeAutomationIntent}"
+intent_identifier="${SIDESTORE_INTENT_IDENTIFIER:-ExecuteRenewalV2Intent}"
+intent_identifiers="${SIDESTORE_INTENT_IDENTIFIERS:-PrepareRenewalV2Intent,ExecuteRenewalV2Intent,FinalizeRenewalV2Intent}"
 xcode_version="${SIDESTORE_XCODE:-27.2}"
 case "$intent_identifier" in
   ''|*[!A-Za-z0-9_]*) echo 'Invalid Swift intent type identifier'; exit 1 ;;
 esac
+if [ "$intent_identifier" != ExecuteRenewalV2Intent ]; then
+  echo 'This wireV2 build requires the ExecuteRenewalV2Intent core type'
+  exit 1
+fi
+if [ "$intent_identifiers" != PrepareRenewalV2Intent,ExecuteRenewalV2Intent,FinalizeRenewalV2Intent ]; then
+  echo 'This wireV2 build requires all three exact V2 metadata identifiers'
+  exit 1
+fi
 IFS=, read -r -a required_intents <<< "$intent_identifiers"
 validator_flags=()
 for identifier in "${required_intents[@]}"; do
