@@ -19,7 +19,7 @@ on:
       intent_identifier:
         description: Swift AppIntent type expected in the compiled metadata
         required: true
-        default: AutomationRefreshIntent
+        default: ExecuteRenewalV2Intent
         type: string
 
 permissions:
@@ -35,8 +35,8 @@ jobs:
     timeout-minutes: 90
     env:
       SIDESTORE_XCODE: ${{ inputs.xcode || '27.2' }}
-      SIDESTORE_INTENT_IDENTIFIER: ${{ inputs.intent_identifier || 'AutomationRefreshIntent' }}
-      SIDESTORE_INTENT_IDENTIFIERS: PrepareAutomationIntent,${{ inputs.intent_identifier || 'AutomationRefreshIntent' }},FinalizeAutomationIntent
+      SIDESTORE_INTENT_IDENTIFIER: ${{ inputs.intent_identifier || 'ExecuteRenewalV2Intent' }}
+      SIDESTORE_INTENT_IDENTIFIERS: PrepareRenewalV2Intent,ExecuteRenewalV2Intent,FinalizeRenewalV2Intent
       SIDESTORE_PATCH_PATH: sidestore-automation/personal-automation.patch
       SIDESTORE_ARTIFACT_DIR: ${{ github.workspace }}/sidestore-automation-artifact
     steps:
