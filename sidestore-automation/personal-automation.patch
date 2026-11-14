@@ -1,41 +1,426 @@
+diff --git a/AltStore/AppDelegate.swift b/AltStore/AppDelegate.swift
+index eb41f3e..3df2044 100644
+--- a/AltStore/AppDelegate.swift
++++ b/AltStore/AppDelegate.swift
+@@ -127,6 +127,7 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
+         // Register default settings before doing anything else.
+         UserDefaults.registerDefaults()
+         BackgroundServiceManager.ensureBackgroundServicesStarted()
++        AutomationPortConfiguration.migrateOnce()
+         syncMinimuxerBackendFromUserDefaults()
+ 
+         SideStoreLogging.setLogging(UserDefaults.standard.isSideStoreVerboseLoggingEnabled)
+@@ -173,10 +174,8 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
+         Task.detached(priority: .userInitiated) {
+             do
+             {
+-                await MaintenanceManager.shared.performDatabaseMigrationIfNeeded()
+-                
+-                debugLog("Starting DatabaseManager...")
+-                try await DatabaseManager.shared.start()
++                debugLog("Preparing preserved SideStore data and database...")
++                try await MaintenanceManager.shared.prepareForUse()
+                 debugLog("Started DatabaseManager.")
+                 
+                 debugLog("Reconciling any staged drafts started...")
+@@ -185,13 +184,13 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
+                 
+                 await WidgetDataManager.publishCurrentInstalledAppsIfNeeded(in: DatabaseManager.shared.viewContext)
+                 
+-                if isFirstLaunch
++                if isFirstLaunch && !AuthManager.shared.isAuthenticated
+                 {
+                     await AuthManager.shared.signOut()
+                 }
+ 
+                 // Perform one-time maintenance tasks after database is started
+-                await MaintenanceManager.shared.performMaintenanceIfNeeded()
++                // prepareForUse completed maintenance before exposing app data.
+             }
+             catch
+             {
+@@ -437,7 +436,7 @@ extension AppDelegate
+             Task.detached(priority: .userInitiated) {
+                 do
+                 {
+-                    try await DatabaseManager.shared.start()
++                    try await MaintenanceManager.shared.prepareForUse()
+                     self.performBackgroundFetch { (backgroundFetchResult) in
+                         backgroundFetchCompletionHandler(backgroundFetchResult)
+                     } refreshAppsCompletionHandler: { (refreshAppsResult) in
+diff --git a/AltStore/Core/Intents/ViewAppIntentHandler.swift b/AltStore/Core/Intents/ViewAppIntentHandler.swift
+index e6f61e0..f0c0625 100644
+--- a/AltStore/Core/Intents/ViewAppIntentHandler.swift
++++ b/AltStore/Core/Intents/ViewAppIntentHandler.swift
+@@ -16,7 +16,7 @@ public class ViewAppIntentHandler: NSObject, ViewAppIntentHandling
+         Task<Void, Never>.detached(priority: .userInitiated) {
+             do
+             {
+-                try await DatabaseManager.shared.start()
++                try await MaintenanceManager.shared.prepareForUse()
+                 let collection = await DatabaseManager.shared.persistentContainer.performBackgroundTask { (context) in
+                     let apps = InstalledApp.all(in: context).map { (installedApp) in
+                         return App(identifier: installedApp.bundleIdentifier, display: installedApp.name)
+diff --git a/AltStore/Intents/App Intents/RefreshAllAppsIntent.swift b/AltStore/Intents/App Intents/RefreshAllAppsIntent.swift
+index 11b9bfb..9a2cb5b 100644
+--- a/AltStore/Intents/App Intents/RefreshAllAppsIntent.swift	
++++ b/AltStore/Intents/App Intents/RefreshAllAppsIntent.swift	
+@@ -56,7 +56,7 @@ struct InstallIPAIntent: AppIntent, ProgressReportingIntent
+     {
+         do
+         {
+-            try await DatabaseManager.shared.start()
++            try await MaintenanceManager.shared.prepareForUse()
+ 
+             let temporaryDirectory = FileManager.default.uniqueTemporaryURL()
+             defer { try? FileManager.default.removeItem(at: temporaryDirectory) }
+@@ -189,7 +189,7 @@ private extension RefreshAllAppsIntent
+ {
+     func refreshAllApps() async throws
+     {
+-        try await DatabaseManager.shared.start()
++        try await MaintenanceManager.shared.prepareForUse()
+         
+         let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
+         let installedApps = await context.perform { InstalledApp.fetchAppsForRefreshingAll(in: context) }
+diff --git a/AltStore/Intents/Legacy/IntentHandler.swift b/AltStore/Intents/Legacy/IntentHandler.swift
+index 581756f..3a74387 100644
+--- a/AltStore/Intents/Legacy/IntentHandler.swift
++++ b/AltStore/Intents/Legacy/IntentHandler.swift
+@@ -51,7 +51,7 @@ final class IntentHandler: NSObject, RefreshAllIntentHandling
+         Task<Void, Never>.detached(priority: .userInitiated) {
+             do
+             {
+-                try await DatabaseManager.shared.start()
++                try await MaintenanceManager.shared.prepareForUse()
+                 self.finish(intent, response: RefreshAllIntentResponse(code: .ready, userActivity: nil))
+                 self.refreshApps(intent: intent)
+             }
+diff --git a/AltStore/LaunchViewController.swift b/AltStore/LaunchViewController.swift
+index 717ac40..96131ca 100644
+--- a/AltStore/LaunchViewController.swift
++++ b/AltStore/LaunchViewController.swift
+@@ -80,7 +80,7 @@ final class LaunchViewController: UIViewController {
+             retries += 1
+         }
+         do {
+-            try await DatabaseManager.shared.start()
++            try await MaintenanceManager.shared.prepareForUse()
+             await self.finishLaunching()
+         } catch {
+             await self.handleLaunchError(error, retryCallback: self.runLaunchSequence)
 diff --git a/AltStore/Managing Apps/AppManager.swift b/AltStore/Managing Apps/AppManager.swift
-index 4f83be72..45968aea 100644
+index 43bb968..d847329 100644
 --- a/AltStore/Managing Apps/AppManager.swift	
 +++ b/AltStore/Managing Apps/AppManager.swift	
-@@ -729,6 +729,30 @@ final class AppManager: ObservableObject, @unchecked Sendable
-         
+@@ -566,6 +566,28 @@ final class AppManager: ObservableObject, @unchecked Sendable
          return actualGroup
      }
-+
-+    /// Automation-only overload: install completion before starting the task,
-+    /// propagate its optional evidence scope, and expose activeTask for joining.
-+    /// The existing refresh entry point and its behavior are unchanged.
+     
++    /// Uses the same upstream refresh pipeline; completion is attached before launch.
 +    func refreshForAutomation(_ app: InstalledApp, dbContext: NSManagedObjectContext,
 +                              evidence: AutomationProfileEvidence,
 +                              completion: AutomationPipelineCompletion) -> RefreshGroup {
-+        let context = self.makeAuthenticatedContext(dbBackgroundContext: dbContext)
-+        let group = RefreshGroup(context: context)
++        let group = RefreshGroup(dbContext: self.getValidDbContext(dbContext))
 +        group.completionHandler = { completion.complete($0) }
 +        let handler = self.makePipelineHandler(presentingViewController: nil)
++        // This method is entered on the caller's owning managed-object queue.
 +        let bundleID = app.bundleIdentifier
 +        group.activeTask = Task.detached {
 +            await AutomationProfileEvidence.$current.withValue(evidence) {
 +                do {
 +                    try await self.pipelineRunner.perform([.refresh(app)], handler: handler, group: group)
 +                } catch {
-+                    group.context.error = error
++                    group.error = error
 +                    group.completionHandler?([bundleID: .failure(error)])
 +                }
 +            }
 +        }
 +        return group
 +    }
-     
++
      func activate(_ installedApp: InstalledApp, presentingViewController: UIViewController?, completionHandler: @escaping (Result<InstalledApp, Error>) -> Void)
      {
+         debugLog("[AppManager] activate() called for app: \(installedApp.bundleIdentifier)")
+diff --git a/AutomationTests/AutomationDiagnosticsTests.swift b/AutomationTests/AutomationDiagnosticsTests.swift
+new file mode 100644
+index 0000000..d6331d9
+--- /dev/null
++++ b/AutomationTests/AutomationDiagnosticsTests.swift
+@@ -0,0 +1,130 @@
++import Foundation
++import XCTest
++@testable import SideStoreAutomationPolicy
++
++private final class PresentationEnvelope: NSError, @unchecked Sendable {
++    let original: NSError
++    init(_ original: NSError) {
++        self.original = original
++        super.init(domain: original.domain, code: original.code, userInfo: original.userInfo)
++    }
++    required init?(coder: NSCoder) { fatalError("No archival is used in this fixture") }
++}
++
++private enum EvidenceScopeFixture {
++    @TaskLocal static var value: String?
++}
++
++final class AutomationDiagnosticsTests: XCTestCase {
++    private let unwrap: (NSError) -> NSError? = { ($0 as? PresentationEnvelope)?.original }
++
++    func testBusinessCodeSurvivesNSErrorBridgeAndUIEnvelope() {
++        let failure = AutomationFailure("profileIdentityMismatch")
++        let bridged = failure as NSError
++        XCTAssertEqual(bridged.domain, AutomationFailure.errorDomain)
++        XCTAssertEqual(bridged.userInfo[AutomationFailure.codeKey] as? String, failure.code)
++        XCTAssertEqual(AutomationFailure.recoveredCode(from: PresentationEnvelope(bridged), unwrap: unwrap), failure.code)
++    }
++
++    func testNestedFoundationUnderlyingErrorPreservesBusinessCode() {
++        let inner = AutomationFailure("profilePlanMismatch") as NSError
++        let outer = NSError(domain: NSCocoaErrorDomain, code: 1, userInfo: [NSUnderlyingErrorKey: inner])
++        XCTAssertEqual(AutomationFailure.recoveredCode(from: outer), "profilePlanMismatch")
++    }
++
++    func testCancellationIdentitySurvivesPresentationEnvelope() {
++        let error = PresentationEnvelope(CancellationError() as NSError)
++        XCTAssertTrue(AutomationFailure.isCancellation(error, unwrap: unwrap))
++        XCTAssertFalse(AutomationFailure.isCancellation(NSError(domain: NSURLErrorDomain, code: -1009)))
++    }
++
++    func testErrorChainIsBoundedAndCycleSafe() {
++        let error = NSError(domain: NSCocoaErrorDomain, code: 1)
++        XCTAssertEqual(AutomationDiagnosticPrivacy.errorChain(error, unwrap: { $0 }).count, 1)
++        let chain = (0..<8).reduce(error) { current, _ in
++            NSError(domain: NSCocoaErrorDomain, code: 2, userInfo: [NSUnderlyingErrorKey: current])
++        }
++        XCTAssertEqual(AutomationDiagnosticPrivacy.errorChain(chain).count, 4)
++    }
++
++    func testDiagnosticsNeverSerializeDescriptionsUserInfoOrUnrecognizedDomains() {
++        let secrets = ["private@example.invalid", "password-value", "https://private.invalid/token", "com.personal.application", "12345678-1234-1234-1234-123456789ABC"]
++        let error = NSError(domain: secrets[0], code: -1, userInfo: [NSLocalizedDescriptionKey: secrets.joined(separator: " "), "Authorization": secrets[1]])
++        let trace = AutomationDiagnosticTrace()
++        _ = trace.enter(.sessionPreparation)
++        let line = trace.failure(error)
++        XCTAssertTrue(line.contains("phase=sessionPreparation"))
++        XCTAssertTrue(line.contains("code=sessionPreparationFailed"))
++        XCTAssertTrue(line.contains("errors=other:-1"))
++        for secret in secrets { XCTAssertFalse(line.contains(secret)) }
++    }
++
++    func testOnlySourceDefinedBusinessCodesCanReachDiagnostics() {
++        let unknown = AutomationFailure("12345678-1234-1234-1234-123456789ABC")
++        XCTAssertEqual(AutomationFailure.recoveredCode(from: unknown), "unclassifiedAutomationFailure")
++        let error = NSError(domain: AutomationFailure.errorDomain, code: 1,
++                            userInfo: [AutomationFailure.codeKey: "private@example.invalid"])
++        XCTAssertNil(AutomationFailure.recoveredCode(from: error))
++        XCTAssertFalse(AutomationDiagnosticTrace().failure(error).contains("private@example.invalid"))
++    }
++
++    func testSafeKnownDomainAndNumericCodeRemainReadable() {
++        let line = AutomationDiagnosticTrace().failure(NSError(domain: NSURLErrorDomain, code: -1009))
++        XCTAssertTrue(line.contains("NSURLErrorDomain:-1009"))
++        XCTAssertTrue(line.contains("code=intentRuntimeFailed"))
++    }
++
++    func testCancellationReasonAndPhaseRemainSeparateFromBusinessOutcome() {
++        let trace = AutomationDiagnosticTrace()
++        _ = trace.enter(.rustdeskPipeline)
++        let user = trace.cancellation(.userCancelled)
++        let timeout = trace.cancellation(.timeout)
++        XCTAssertTrue(user.contains("phase=rustdeskPipeline reason=userCancelled"))
++        XCTAssertTrue(timeout.contains("phase=rustdeskPipeline reason=timeout"))
++        XCTAssertEqual(trace.currentStage, .rustdeskPipeline)
++    }
++
++    func testOldPersistedLeaseDecodesWithoutAnyNewDiagnosticFields() throws {
++        let old = #"{"runID":"77B875E7-047C-4127-9E88-A7BA25BF8230","phase":"prepared","report":{"schemaVersion":1,"runID":"77B875E7-047C-4127-9E88-A7BA25BF8230","terminal":false,"cleanupAllowed":false,"outcome":"unverified","rustdesk":{"completed":false,"bundleID":"com.bearberni.rustdesk.v2","installedProfileUUIDs":[]},"sidestore":{"completed":false,"bundleID":"","installedProfileUUIDs":[]},"errors":[]}}"#
++        // Decode an actual old-model serialization rather than manufacturing
++        // defaults for a new model. Diagnostics did not add Codable properties.
++        let fixture = AutomationLease(runID: "77B875E7-047C-4127-9E88-A7BA25BF8230", phase: .prepared,
++                                     report: .init(runID: "77B875E7-047C-4127-9E88-A7BA25BF8230"))
++        let serialized = try JSONEncoder().encode(fixture)
++        XCTAssertEqual(try JSONDecoder().decode(AutomationLease.self, from: Data(old.utf8)), fixture)
++        XCTAssertEqual(try JSONDecoder().decode(AutomationLease.self, from: serialized), fixture)
++        XCTAssertFalse(String(decoding: serialized, as: UTF8.self).contains("diagnostic"))
++    }
++
++    func testWireV2RemainsStringOnlyAndCompatibleWithExistingShortcut() throws {
++        var report = AutomationRefreshReport(runID: "77B875E7-047C-4127-9E88-A7BA25BF8230")
++        report.terminal = true
++        report.cleanupAllowed = true
++        report.outcome = .failed
++        report.errors = [.init(code: "sessionPreparationFailed", app: "rustdesk")]
++        let json = AutomationExecuteV2Report(report: report).json
++        let values = try JSONDecoder().decode([String: String].self, from: Data(json.utf8))
++        XCTAssertEqual(values["protocol"], "sidestore-personal-renewal/2")
++        XCTAssertEqual(values["completionState"], "terminal")
++        XCTAssertEqual(values["cleanupState"], "allowed")
++        XCTAssertEqual(values["errorCode"], "sessionPreparationFailed")
++    }
++
++    func testStructuredChildrenInheritTaskLocalAndDetachedNeedsExplicitBinding() async {
++        let structured: String? = await EvidenceScopeFixture.$value.withValue("scope-present") {
++            await withTaskGroup(of: String?.self) { group in
++                group.addTask { EvidenceScopeFixture.value }
++                return await group.next() ?? nil
++            }
++        }
++        let detached: String? = await EvidenceScopeFixture.$value.withValue("scope-present") {
++            await Task.detached { EvidenceScopeFixture.value }.value
++        }
++        let rebound: String? = await Task.detached {
++            EvidenceScopeFixture.$value.withValue("scope-present") { EvidenceScopeFixture.value }
++        }.value
++        XCTAssertEqual(structured, "scope-present")
++        XCTAssertNil(detached)
++        XCTAssertEqual(rebound, "scope-present")
++    }
++}
+diff --git a/AutomationTests/AutomationPortConfigurationTests.swift b/AutomationTests/AutomationPortConfigurationTests.swift
+new file mode 100644
+index 0000000..9c9aa22
+--- /dev/null
++++ b/AutomationTests/AutomationPortConfigurationTests.swift
+@@ -0,0 +1,134 @@
++import Foundation
++import XCTest
++@testable import SideStoreAutomationPolicy
++
++final class AutomationPortConfigurationTests: XCTestCase {
++    private typealias Keys = AutomationPortConfiguration.Keys
++
++    private func isolated(_ body: (UserDefaults) throws -> Void) rethrows {
++        let suite = "SideStoreAutomationPortTests." + UUID().uuidString
++        let defaults = UserDefaults(suiteName: suite)!
++        defaults.removePersistentDomain(forName: suite)
++        defer { defaults.removePersistentDomain(forName: suite) }
++        try body(defaults)
++    }
++
++    func testTemporaryManualPortBecomesHintAndHasLocalRollbackCopy() {
++        isolated { defaults in
++            defaults.set(64636, forKey: Keys.manualPort)
++            defaults.set(false, forKey: Keys.automaticRetry)
++            XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .migratedWithManualHint)
++            XCTAssertNil(defaults.object(forKey: Keys.manualPort))
++            XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), 64636)
++            XCTAssertEqual(defaults.integer(forKey: Keys.rollbackManualPort), 64636)
++            XCTAssertTrue(defaults.bool(forKey: Keys.automaticRetry))
++            XCTAssertEqual(defaults.integer(forKey: Keys.version), 1)
++        }
++    }
++
++    func testMigrationUsesProvidedPortRatherThanHardcodedObservedPort() {
++        for port in [1, 12345, 49153, 65535] {
++            isolated { defaults in
++                defaults.set(port, forKey: Keys.manualPort)
++                XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .migratedWithManualHint)
++                XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), port)
++                XCTAssertEqual(defaults.integer(forKey: Keys.rollbackManualPort), port)
++            }
++        }
++    }
++
++    func testValidManualSelectionSupersedesOlderDiscoveredCache() {
++        isolated { defaults in
++            defaults.set(12345, forKey: Keys.discoveredPort)
++            defaults.set(64636, forKey: Keys.manualPort)
++            _ = AutomationPortConfiguration.migrateOnce(to: defaults)
++            XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), 64636)
++        }
++    }
++
++    func testExistingValidDiscoveryCacheIsRetainedWithoutManualPort() {
++        isolated { defaults in
++            defaults.set(54321, forKey: Keys.discoveredPort)
++            XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .migratedWithExistingHint)
++            XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), 54321)
++            XCTAssertNil(defaults.object(forKey: Keys.rollbackManualPort))
++        }
++    }
++
++    func testRepeatedCallDoesNotOverwriteLaterManualChoiceOrRetryPreference() {
++        isolated { defaults in
++            defaults.set(64636, forKey: Keys.manualPort)
++            _ = AutomationPortConfiguration.migrateOnce(to: defaults)
++            defaults.set(23456, forKey: Keys.manualPort)
++            defaults.set(34567, forKey: Keys.discoveredPort)
++            defaults.set(false, forKey: Keys.automaticRetry)
++            XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .alreadyApplied)
++            XCTAssertEqual(defaults.integer(forKey: Keys.manualPort), 23456)
++            XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), 34567)
++            XCTAssertEqual(defaults.integer(forKey: Keys.rollbackManualPort), 64636)
++            XCTAssertFalse(defaults.bool(forKey: Keys.automaticRetry))
++        }
++    }
++
++    func testFutureMigrationMarkerIsNotDowngraded() {
++        isolated { defaults in
++            defaults.set(2, forKey: Keys.version)
++            defaults.set(23456, forKey: Keys.manualPort)
++            XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .alreadyApplied)
++            XCTAssertEqual(defaults.integer(forKey: Keys.manualPort), 23456)
++            XCTAssertEqual(defaults.integer(forKey: Keys.version), 2)
++        }
++    }
++
++    func testMalformedManualPortsNeverBecomeHintsOrRollbackValues() {
++        let invalid: [Any] = [0, -1, 65536, Int.max, true, false, 12345.0, 12345.5, "64636", "invalid", Data([1, 2])]
++        for value in invalid {
++            isolated { defaults in
++                defaults.set(value, forKey: Keys.manualPort)
++                XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .migratedWithoutHint)
++                XCTAssertNil(defaults.object(forKey: Keys.manualPort))
++                XCTAssertNil(defaults.object(forKey: Keys.discoveredPort))
++                XCTAssertNil(defaults.object(forKey: Keys.rollbackManualPort))
++                XCTAssertTrue(defaults.bool(forKey: Keys.automaticRetry))
++            }
++        }
++    }
++
++    func testInvalidManualValueDoesNotDestroyValidExistingCache() {
++        isolated { defaults in
++            defaults.set(70000, forKey: Keys.manualPort)
++            defaults.set(54321, forKey: Keys.discoveredPort)
++            XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .migratedWithExistingHint)
++            XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), 54321)
++        }
++    }
++
++    func testInvalidDiscoveredCacheIsNotUsedAsHint() {
++        let invalid: [Any] = ["64636", 12345.5, true, 65536]
++        for value in invalid {
++            isolated { defaults in
++                defaults.set(value, forKey: Keys.discoveredPort)
++                XCTAssertEqual(AutomationPortConfiguration.migrateOnce(to: defaults), .migratedWithoutHint)
++                XCTAssertNil(defaults.object(forKey: Keys.discoveredPort))
++            }
++        }
++    }
++
++    func testPreviouslySavedRollbackSurvivesAnInterruptedMigration() {
++        isolated { defaults in
++            defaults.set(12345, forKey: Keys.rollbackManualPort)
++            defaults.set(23456, forKey: Keys.manualPort)
++            _ = AutomationPortConfiguration.migrateOnce(to: defaults)
++            XCTAssertEqual(defaults.integer(forKey: Keys.rollbackManualPort), 12345)
++            XCTAssertEqual(defaults.integer(forKey: Keys.discoveredPort), 23456)
++        }
++    }
++
++    func testUnrelatedPreferencesAreUntouched() {
++        isolated { defaults in
++            defaults.set("preserve", forKey: "unrelatedPreference")
++            _ = AutomationPortConfiguration.migrateOnce(to: defaults)
++            XCTAssertEqual(defaults.string(forKey: "unrelatedPreference"), "preserve")
++        }
++    }
++}
 diff --git a/AutomationTests/AutomationRefreshPolicyTests.swift b/AutomationTests/AutomationRefreshPolicyTests.swift
 new file mode 100644
-index 00000000..6921a1e3
+index 0000000..6921a1e
 --- /dev/null
 +++ b/AutomationTests/AutomationRefreshPolicyTests.swift
 @@ -0,0 +1,339 @@
@@ -378,34 +763,348 @@ index 00000000..6921a1e3
 +        XCTAssertEqual(decoded.outcome, .failed)
 +    }
 +}
+diff --git a/AutomationTests/UpgradeStorageTests.swift b/AutomationTests/UpgradeStorageTests.swift
+new file mode 100644
+index 0000000..1c52085
+--- /dev/null
++++ b/AutomationTests/UpgradeStorageTests.swift
+@@ -0,0 +1,207 @@
++import XCTest
++import Foundation
++import SQLite3
++@testable import SideStoreAutomationPolicy
++
++final class UpgradeStorageTests: XCTestCase {
++    private func directory() throws -> URL {
++        let url = FileManager.default.temporaryDirectory.appendingPathComponent("UpgradeStorageSynthetic-" + UUID().uuidString)
++        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
++        return url
++    }
++
++    private func execute(_ db: OpaquePointer, _ sql: String) throws {
++        let status = sqlite3_exec(db, sql, nil, nil, nil)
++        guard status == SQLITE_OK else {
++            throw AutomationUpgradeStorageError.sqlite(stage: "syntheticFixture", code: status)
++        }
++    }
++
++    private func open(_ url: URL) throws -> OpaquePointer {
++        var db: OpaquePointer?
++        let result = sqlite3_open_v2(url.path, &db, SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE, nil)
++        guard result == SQLITE_OK, let db else {
++            throw AutomationUpgradeStorageError.sqlite(stage: "syntheticOpen", code: result)
++        }
++        return db
++    }
++
++    private func count(_ url: URL) throws -> Int {
++        let db = try open(url)
++        defer { sqlite3_close(db) }
++        var statement: OpaquePointer?
++        XCTAssertEqual(sqlite3_prepare_v2(db, "SELECT count(*) FROM fixture", -1, &statement, nil), SQLITE_OK)
++        guard let statement else { throw AutomationUpgradeStorageError.invalidSQLite }
++        defer { sqlite3_finalize(statement) }
++        XCTAssertEqual(sqlite3_step(statement), SQLITE_ROW)
++        return Int(sqlite3_column_int(statement, 0))
++    }
++
++    private func fixture(_ url: URL, wal: Bool = true) throws -> OpaquePointer {
++        let db = try open(url)
++        try execute(db, wal ? "PRAGMA journal_mode=WAL" : "PRAGMA journal_mode=DELETE")
++        try execute(db, "PRAGMA wal_autocheckpoint=0")
++        try execute(db, "CREATE TABLE fixture(value TEXT NOT NULL)")
++        try execute(db, "INSERT INTO fixture VALUES('synthetic-committed')")
++        return db
++    }
++
++    func testCommittedWALIsIncludedAndLegacyBytesRemainUnchanged() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_close(writer) }
++        let wal = URL(fileURLWithPath: source.path + "-wal")
++        XCTAssertTrue(FileManager.default.fileExists(atPath: wal.path))
++        let sourceHash = try AutomationUpgradeStorage.fileSHA256(source)
++        let walHash = try AutomationUpgradeStorage.fileSHA256(wal)
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        XCTAssertEqual(try count(target), 1)
++        XCTAssertEqual(try AutomationUpgradeStorage.fileSHA256(source), sourceHash)
++        XCTAssertEqual(try AutomationUpgradeStorage.fileSHA256(wal), walHash)
++        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(".upgrade-preservation").path))
++    }
++
++    func testUncommittedWriterChangesAreExcluded() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_exec(writer, "ROLLBACK", nil, nil, nil); sqlite3_close(writer) }
++        try execute(writer, "BEGIN IMMEDIATE")
++        try execute(writer, "INSERT INTO fixture VALUES('synthetic-uncommitted')")
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        XCTAssertEqual(try count(target), 1)
++    }
++
++    func testExistingUnownedTargetIsNeverOverwritten() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let a = try fixture(source), b = try fixture(target, wal: false)
++        sqlite3_close(a); sqlite3_close(b)
++        let before = try AutomationUpgradeStorage.fileSHA256(target)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target))
++        XCTAssertEqual(try AutomationUpgradeStorage.fileSHA256(target), before)
++        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
++    }
++
++    func testCommittedReceiptAllowsNewTargetUseWithoutResettingIt() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_close(writer) }
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        let current = try open(target)
++        try execute(current, "INSERT INTO fixture VALUES('synthetic-current-target')")
++        sqlite3_close(current)
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        XCTAssertEqual(try count(target), 2)
++    }
++
++    func testChangedLegacyAfterReceiptFailsWithoutReplacingTarget() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_close(writer) }
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        try execute(writer, "INSERT INTO fixture VALUES('synthetic-later-legacy')")
++        XCTAssertThrowsError(try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target))
++        XCTAssertEqual(try count(target), 1)
++    }
++
++    func testPreparedReceiptCanRecoverOnlyAnExactSnapshotTarget() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_close(writer) }
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        let receipt = root.appendingPathComponent(".new.sqlite.upgrade-receipt.json")
++        var json = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as! [String: Any]
++        json["phase"] = "prepared"
++        try JSONSerialization.data(withJSONObject: json).write(to: receipt, options: .atomic)
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        let reread = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as! [String: Any]
++        XCTAssertEqual(reread["phase"] as? String, "committed")
++    }
++
++    func testPreparedReceiptRejectsAChangedTarget() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_close(writer) }
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        let receipt = root.appendingPathComponent(".new.sqlite.upgrade-receipt.json")
++        var json = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as! [String: Any]
++        json["phase"] = "prepared"
++        try JSONSerialization.data(withJSONObject: json).write(to: receipt, options: .atomic)
++        let targetWriter = try open(target)
++        try execute(targetWriter, "INSERT INTO fixture VALUES('synthetic-uncertain-target')")
++        sqlite3_close(targetWriter)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target))
++        XCTAssertEqual(try count(target), 2)
++    }
++
++    func testSnapshotIntegrityFailureDoesNotReplaceCurrentDatabase() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source)
++        defer { sqlite3_close(writer) }
++        try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target)
++        let receipt = root.appendingPathComponent(".new.sqlite.upgrade-receipt.json")
++        let json = try JSONSerialization.jsonObject(with: Data(contentsOf: receipt)) as! [String: Any]
++        let snapshot = root.appendingPathComponent(".upgrade-preservation").appendingPathComponent(json["snapshotName"] as! String)
++        try Data("synthetic-corrupt-backup".utf8).write(to: snapshot)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target))
++        XCTAssertEqual(try count(target), 1)
++    }
++
++    func testExclusiveSourceLockFailsBoundedlyWithoutPublication() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        let writer = try fixture(source, wal: false)
++        defer { sqlite3_exec(writer, "ROLLBACK", nil, nil, nil); sqlite3_close(writer) }
++        try execute(writer, "BEGIN EXCLUSIVE")
++        let start = ProcessInfo.processInfo.systemUptime
++        XCTAssertThrowsError(try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target))
++        XCTAssertLessThan(ProcessInfo.processInfo.systemUptime - start, 5)
++        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
++        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
++    }
++
++    func testFileCopyIsVerifiedAndEqualDuplicateIsIdempotent() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.der"), target = root.appendingPathComponent("new.der")
++        let bytes = Data("synthetic-certificate-bytes".utf8)
++        try bytes.write(to: source)
++        try AutomationUpgradeStorage.verifiedCopy(source: source, destination: target)
++        try AutomationUpgradeStorage.verifiedCopy(source: source, destination: target)
++        XCTAssertEqual(try Data(contentsOf: source), bytes)
++        XCTAssertEqual(try Data(contentsOf: target), bytes)
++    }
++
++    func testSameSizeDifferentTargetFailsAndPreservesBoth() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.der"), target = root.appendingPathComponent("new.der")
++        try Data("first".utf8).write(to: source)
++        try Data("other".utf8).write(to: target)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.verifiedCopy(source: source, destination: target))
++        XCTAssertEqual(try String(contentsOf: source), "first")
++        XCTAssertEqual(try String(contentsOf: target), "other")
++    }
++
++    func testDirectoryCopyVerifiesContentAndRejectsSymlinks() throws {
++        let root = try directory(), source = root.appendingPathComponent("Old.app"), target = root.appendingPathComponent("New.app")
++        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
++        try Data("synthetic-app".utf8).write(to: source.appendingPathComponent("Executable"))
++        try AutomationUpgradeStorage.verifiedCopy(source: source, destination: target)
++        XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("Executable")), Data("synthetic-app".utf8))
++        let linked = root.appendingPathComponent("linked")
++        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: source)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.verifiedCopy(source: linked, destination: root.appendingPathComponent("Never.app")))
++    }
++
++    func testInvalidSQLiteFailsBeforePublishingTarget() throws {
++        let root = try directory(), source = root.appendingPathComponent("old.sqlite"), target = root.appendingPathComponent("new.sqlite")
++        try Data("synthetic-non-database".utf8).write(to: source)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.preserveSQLite(source: source, destination: target))
++        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
++        XCTAssertEqual(try String(contentsOf: source), "synthetic-non-database")
++    }
++
++    func testCounterReadbackAndMalformedValueFailClosed() throws {
++        let root = try directory(), counter = root.appendingPathComponent(".maintenance_counter")
++        XCTAssertEqual(try AutomationUpgradeStorage.readCounter(at: counter, maximum: 5), 0)
++        try AutomationUpgradeStorage.writeCounter(4, at: counter)
++        XCTAssertEqual(try AutomationUpgradeStorage.readCounter(at: counter, maximum: 5), 4)
++        try Data("not-a-counter".utf8).write(to: counter)
++        XCTAssertThrowsError(try AutomationUpgradeStorage.readCounter(at: counter, maximum: 5))
++    }
++}
 diff --git a/Package.swift b/Package.swift
 new file mode 100644
-index 00000000..90e7cf7e
+index 0000000..8922e42
 --- /dev/null
 +++ b/Package.swift
-@@ -0,0 +1,16 @@
+@@ -0,0 +1,17 @@
 +// swift-tools-version: 6.0
 +import PackageDescription
 +
-+// Dependency-free tests of the SAME policy/model file compiled into SideStore.
++// Tests of the SAME Foundation/SQLite policy and upgrade code compiled into SideStore.
 +// The real AppIntents/CoreData/FFI integration is compiled by the iOS archive job.
 +let package = Package(
 +    name: "SideStoreAutomationPolicy",
 +    platforms: [.macOS(.v13)],
 +    products: [.library(name: "SideStoreAutomationPolicy", targets: ["SideStoreAutomationPolicy"])],
 +    targets: [
-+        .target(name: "SideStoreAutomationPolicy", path: "SideStore/Core/Automation",
++        .systemLibrary(name: "SQLite3", path: "SQLite3", pkgConfig: "sqlite3"),
++        .target(name: "SideStoreAutomationPolicy", dependencies: ["SQLite3"], path: "SideStore/Core/Automation",
 +                exclude: ["AutomationRefreshIntent.swift", "AutomationRefreshCoordinator.swift", "AutomationProfileEvidence.swift"],
-+                sources: ["AutomationRefreshPolicy.swift"]),
-+        .testTarget(name: "SideStoreAutomationPolicyTests", dependencies: ["SideStoreAutomationPolicy"], path: "AutomationTests")
++                sources: ["AutomationRefreshPolicy.swift", "AutomationPortConfiguration.swift", "AutomationUpgradeStorage.swift"]),
++        .testTarget(name: "SideStoreAutomationPolicyTests", dependencies: ["SideStoreAutomationPolicy", "SQLite3"], path: "AutomationTests")
 +    ]
 +)
+diff --git a/SQLite3/module.modulemap b/SQLite3/module.modulemap
+new file mode 100644
+index 0000000..128774c
+--- /dev/null
++++ b/SQLite3/module.modulemap
+@@ -0,0 +1,5 @@
++module SQLite3 [system] {
++    header "shim.h"
++    link "sqlite3"
++    export *
++}
+diff --git a/SQLite3/shim.h b/SQLite3/shim.h
+new file mode 100644
+index 0000000..f52e1f0
+--- /dev/null
++++ b/SQLite3/shim.h
+@@ -0,0 +1 @@
++#include <sqlite3.h>
+diff --git a/SideStore/Core/Automation/AutomationPortConfiguration.swift b/SideStore/Core/Automation/AutomationPortConfiguration.swift
+new file mode 100644
+index 0000000..e9460ab
+--- /dev/null
++++ b/SideStore/Core/Automation/AutomationPortConfiguration.swift
+@@ -0,0 +1,76 @@
++import Foundation
++
++/// One-time transition from the temporary manual RP port to the upstream
++/// discovery policy. This touches connection preferences only, never pairing
++/// material, account credentials, certificates, leases or installed-app data.
++enum AutomationPortConfiguration {
++    enum Keys {
++        // 151d3378 UserDefaults+AltStore uses these exact #function keys.
++        static let manualPort = "remotePairingPortOverride"
++        static let discoveredPort = "lastDiscoveredRemotePairingPort"
++        static let automaticRetry = "isAutoRetryRemotePairingPortEnabled"
++        // Private local rollback/configuration bookkeeping, not server data.
++        static let rollbackManualPort = "SideStore.PersonalAutomation.RPPortMigration.rollbackManualPort"
++        static let version = "SideStore.PersonalAutomation.RPPortMigration.version"
++    }
++
++    enum Result: Equatable {
++        case alreadyApplied
++        case migratedWithManualHint
++        case migratedWithExistingHint
++        case migratedWithoutHint
++    }
++
++    private static let currentVersion = 1
++    private static let lock = NSLock()
++
++    /// Run before syncMinimuxerBackendFromUserDefaults() during app startup.
++    /// No fixed TCP port is embedded. A hint is only a first attempt; the
++    /// upstream retry/discovery path remains free to replace it when needed.
++    @discardableResult
++    static func migrateOnce(to defaults: UserDefaults = .standard) -> Result {
++        lock.withLock {
++            guard defaults.integer(forKey: Keys.version) < currentVersion else {
++                return .alreadyApplied
++            }
++
++            let manual = validPort(defaults.object(forKey: Keys.manualPort))
++            let existing = validPort(defaults.object(forKey: Keys.discoveredPort))
++            let result: Result
++            if let manual {
++                // Preserve the original valid manual selection, including if
++                // a prior launch ended before committing the version marker.
++                if validPort(defaults.object(forKey: Keys.rollbackManualPort)) == nil {
++                    defaults.set(manual, forKey: Keys.rollbackManualPort)
++                }
++                defaults.set(manual, forKey: Keys.discoveredPort)
++                result = .migratedWithManualHint
++            } else if existing != nil {
++                result = .migratedWithExistingHint
++            } else {
++                // Do not let integer(forKey:) coerce a malformed cached value
++                // into an apparently valid starting port in the upstream code.
++                defaults.removeObject(forKey: Keys.discoveredPort)
++                result = .migratedWithoutHint
++            }
++
++            defaults.removeObject(forKey: Keys.manualPort)
++            defaults.set(true, forKey: Keys.automaticRetry)
++            // Commit last. An interrupted migration can safely be repeated;
++            // later explicit user configuration is never overwritten.
++            defaults.set(currentVersion, forKey: Keys.version)
++            return result
++        }
++    }
++
++    private static func validPort(_ value: Any?) -> Int? {
++        guard let number = value as? NSNumber else { return nil }
++        // UserDefaults' official setter stores an integer. Reject Booleans,
++        // floating point values, numeric strings and out-of-range values.
++        let kind = String(cString: number.objCType)
++        guard ["s", "i", "l", "q", "S", "I", "L", "Q"].contains(kind) else { return nil }
++        let port = number.int64Value
++        guard port > 0, port <= Int64(UInt16.max) else { return nil }
++        return Int(port)
++    }
++}
 diff --git a/SideStore/Core/Automation/AutomationProfileEvidence.swift b/SideStore/Core/Automation/AutomationProfileEvidence.swift
 new file mode 100644
-index 00000000..943c255c
+index 0000000..6de5a45
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationProfileEvidence.swift
-@@ -0,0 +1,162 @@
+@@ -0,0 +1,157 @@
 +import Foundation
 +import CryptoKit
 +import SideSign
@@ -563,17 +1262,12 @@ index 00000000..943c255c
 +        return result
 +    }
 +}
-+
-+struct AutomationFailure: Error, Sendable {
-+    let code: String
-+    init(_ code: String) { self.code = code }
-+}
 diff --git a/SideStore/Core/Automation/AutomationRefreshCoordinator.swift b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
 new file mode 100644
-index 00000000..0800dc3c
+index 0000000..8fcca47
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshCoordinator.swift
-@@ -0,0 +1,465 @@
+@@ -0,0 +1,484 @@
 +import Foundation
 +import CryptoKit
 +@preconcurrency import CoreData
@@ -581,6 +1275,7 @@ index 00000000..0800dc3c
 +import Minimuxer
 +
 +final class AutomationCancellation: @unchecked Sendable {
++    let diagnostics = AutomationDiagnosticTrace()
 +    private let lock = NSLock()
 +    private var cancelled = false
 +    private var group: RefreshGroup?
@@ -759,6 +1454,7 @@ index 00000000..0800dc3c
 +        let report = await withTaskCancellationHandler {
 +            await task.value
 +        } onCancel: {
++            debugLog(requestedCancellation.diagnostics.cancellation(.parentTaskCancelled))
 +            requestedCancellation.cancel()
 +        }
 +        return storeTerminal(report)
@@ -856,17 +1552,23 @@ index 00000000..0800dc3c
 +private enum AutomationRefreshWorker {
 +    static func run(runID: String, progress: Progress, cancellation: AutomationCancellation) async -> AutomationRefreshReport {
 +        var report = AutomationRefreshReport(runID: runID)
++        let diagnostics = cancellation.diagnostics
 +        progress.totalUnitCount = 220
 +        progress.localizedDescription = "Renewing RustDesk V2 and SideStore"
 +        do {
 +            try cancellation.check()
-+            try await DatabaseManager.shared.start()
++            debugLog(diagnostics.enter(.databaseStartup))
++            try await MaintenanceManager.shared.prepareForUse()
 +            guard !CellularRefreshManager.shared.isEnabled else { throw AutomationFailure("cellularRefreshMustBeDisabled") }
 +            guard !AppManager.shared.isActivelyManagingAnyApp else { throw AutomationFailure("anotherOperationActive") }
++            debugLog(diagnostics.enter(.deviceConnection))
 +            try await waitForNetworkReady(progress: progress, cancellation: cancellation)
++            debugLog(diagnostics.enter(.teamResolution))
 +            _ = try await AuthManager.shared.getAuthenticatedTeam()
++            debugLog(diagnostics.enter(.sessionPreparation))
 +            _ = try await AuthManager.shared.getAuthenticatedSession()
 +            try cancellation.check()
++            debugLog(diagnostics.enter(.targetSelection))
 +            let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
 +            let targets = try await context.perform { try findTargets(context: context) }
 +            report.rustdesk.bundleID = targets[0].installedID
@@ -876,6 +1578,7 @@ index 00000000..0800dc3c
 +            for (index, target) in targets.enumerated() {
 +                try cancellation.check()
 +                guard !AppManager.shared.isActivelyManagingAnyApp else { throw AutomationFailure("anotherOperationActive") }
++                debugLog(diagnostics.enter(index == 0 ? .rustdeskPipeline : .sidestorePipeline))
 +                progress.localizedAdditionalDescription = index == 0 ? "Refreshing RustDesk V2" : "Refreshing SideStore"
 +                let evidence = AutomationProfileEvidence(mainBundleID: target.installedID,
 +                    certificateSerial: target.certificateSerial, expectedProfileIDs: target.profileIDs)
@@ -905,6 +1608,7 @@ index 00000000..0800dc3c
 +                }
 +                guard AutomationRefreshPolicy.exactCompletion(requested: target.originalID,
 +                    resultIDs: ids, succeededIDs: successes) else { throw AutomationFailure("emptyOrMismatchedResult") }
++                debugLog(diagnostics.enter(index == 0 ? .rustdeskReadback : .sidestoreReadback))
 +                progress.localizedAdditionalDescription = "Verifying installed profiles"
 +                let proof: (profiles: [AutomationProfileEvidence.Profile], main: AutomationProfileEvidence.Profile)
 +                do { proof = try await evidence.verifyInstalledOnDevice() }
@@ -917,10 +1621,13 @@ index 00000000..0800dc3c
 +                if index == 0 { report.rustdesk = appReport } else { report.sidestore = appReport }
 +            }
 +            guard report.rustdesk.completed && report.sidestore.completed else { throw AutomationFailure("missingTargetCompletion") }
++            debugLog(diagnostics.enter(.verifiedTerminal))
 +            report.outcome = .success
 +        } catch {
-+            let code = (error as? AutomationFailure)?.code ?? "refreshFailedSeeSideStoreLog"
-+            if cancellation.isCancelled || error is CancellationError {
++            let unwrap: (NSError) -> NSError? = { ($0 as? ALTWrappedError)?.wrappedError }
++            debugLog(diagnostics.failure(error, unwrap: unwrap))
++            let code = AutomationFailure.recoveredCode(from: error, unwrap: unwrap) ?? diagnostics.currentStage.fallbackCode
++            if cancellation.isCancelled || AutomationFailure.isCancellation(error, unwrap: unwrap) {
 +                report.outcome = .cancelled
 +            } else if code.hasPrefix("profileReadback") || ["deviceProfileVerificationUnavailable", "nativeInstallEvidenceMissing", "invalidCompletionCount", "emptyOrMismatchedResult"].contains(code) {
 +                report.outcome = .unverified
@@ -944,23 +1651,21 @@ index 00000000..0800dc3c
 +            try cancellation.check()
 +            attempt += 1
 +            progress.localizedAdditionalDescription = "Waiting for LocalDevVPN (\(attempt))"
-+            // These are sequential awaits, not a timer racing the probe. Even
-+            // cancellation waits for an in-flight native check to finish before
-+            // this method returns. The 30s window stops new probes; draining
-+            // an already-started native call may take additional time.
-+            await minimuxer.network.refreshEndpoint()
-+            try cancellation.check()
-+            let result = await minimuxer.core.isReady(withNetworkCheck: true)
-+            try cancellation.check()
-+            guard AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: started, now: ProcessInfo.processInfo.systemUptime) else {
-+                throw AutomationFailure("networkReadinessTimedOut")
-+            }
-+            switch result {
-+            case .success(true):
++            do {
++                // Use the SAME upstream entry point as ordinary refreshes. It
++                // performs bounded RemotePairing discovery/port recovery.
++                // Await it directly: no timeout/cancellation race may outlive
++                // the transport operation and permit early VPN teardown.
++                try await ensureMinimuxerReady()
++                try cancellation.check()
++                guard AutomationRefreshPolicy.mayStartReadinessProbe(startedAt: started, now: ProcessInfo.processInfo.systemUptime) else {
++                    throw AutomationFailure("networkReadinessTimedOut")
++                }
 +                return
-+            case .success(false):
-+                throw AutomationFailure("networkReadinessUnverified")
-+            case .failure(let error):
++            } catch {
++                if cancellation.isCancelled || AutomationFailure.isCancellation(error) { throw error }
++                if AutomationFailure.recoveredCode(from: error) != nil { throw error }
++                debugLog(cancellation.diagnostics.failure(error))
 +                let kind = readinessKind(error)
 +                let remotePairing = minimuxer.gateway.pairingFileType == .rppairing
 +                guard AutomationRefreshPolicy.mayRetryReadiness(kind, remotePairing: remotePairing) else {
@@ -975,25 +1680,26 @@ index 00000000..0800dc3c
 +        throw AutomationFailure("networkReadinessTimedOut")
 +    }
 +
-+    private static func readinessKind(_ error: MinimuxerError) -> AutomationRefreshPolicy.ReadinessFailure {
-+        switch error {
-+        case .invalidPairing, .pairingNotLoaded:
-+            return .invalidPairing
-+        case .noVPN(let reason):
-+            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .missingTunnel
-+        case .noConnection(let reason):
-+            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .networkUnavailable
-+        case .noDevice(let reason):
-+            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .endpointNotReady
-+        case .notReachable(let reason):
-+            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .peerUnreachable
-+        case .invalidVPN(let reason):
-+            return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .invalidVPN
-+        default:
-+            // Includes notStarted, unconfigured transport and native service
-+            // errors: do not guess that a pairing/locked-device error is transient.
-+            return .unknown
++    private static func readinessKind(_ error: Error) -> AutomationRefreshPolicy.ReadinessFailure {
++        // Upstream ensureMinimuxerReady surfaces OperationError after its own
++        // discovery retry. Do not bypass it by calling core.isReady directly.
++        if let operation = error as? OperationError {
++            switch operation {
++            case .invalidPairingFile, .pairingNotComplete: return .invalidPairing
++            case .noVPN(let reason):
++                return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .missingTunnel
++            case .noConnection(let reason):
++                return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .networkUnavailable
++            case .noDevice(let reason), .unknownUDID(let reason):
++                return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .endpointNotReady
++            case .notReachable(let reason):
++                return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .peerUnreachable
++            case .invalidVPN(let reason):
++                return AutomationRefreshPolicy.readinessReasonIsPermanent(reason) ? .locked : .invalidVPN
++            default: return .unknown
++            }
 +        }
++        return .unknown
 +    }
 +
 +    private static func findTargets(context: NSManagedObjectContext) throws -> [AutomationTarget] {
@@ -1003,8 +1709,15 @@ index 00000000..0800dc3c
 +        guard rustdesk.count == 1, own.count == 1 else { throw AutomationFailure("missingOrAmbiguousTarget") }
 +        return try [rustdesk[0], own[0]].enumerated().map { index, app in
 +            guard app.isActive, let bundle = ALTApplication(fileURL: app.fileURL),
-+                  let certificate = CertificateManager.shared.getSigningCertificate(at: bundle.fileURL) else {
++                  let certificate = CertificateManager.shared.getSigningCertificate(for: app) else {
 +                throw AutomationFailure("targetOrSigningIdentityUnavailable")
++            }
++            // The official selector uses the self binary or the app's saved DER.
++            // A cached payload may be unsigned/old-signed and is not a second
++            // authority for the current signing serial. Never create a cert.
++            if let recordedSerial = app.certificateSerialNumber, !recordedSerial.isEmpty,
++               recordedSerial.caseInsensitiveCompare(certificate.serialNumber) != .orderedSame {
++                throw AutomationFailure("cachedSigningIdentityMismatch")
 +            }
 +            let installed = app.resignedBundleIdentifier
 +            if index == 0 {
@@ -1041,10 +1754,10 @@ index 00000000..0800dc3c
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshIntent.swift b/SideStore/Core/Automation/AutomationRefreshIntent.swift
 new file mode 100644
-index 00000000..8f8d2baa
+index 0000000..8d373b1
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshIntent.swift
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,101 @@
 +import AppIntents
 +import Foundation
 +
@@ -1107,10 +1820,14 @@ index 00000000..8f8d2baa
 +        do {
 +            report = try await performBackgroundTask {
 +                await AutomationRefreshCoordinator.shared.execute(runID: runID, progress: progress, cancellation: cancellation)
-+            } onCancel: { _ in
++            } onCancel: { reason in
++                let origin: AutomationCancellationOrigin = reason == .userCancelled ? .userCancelled : reason == .timeout ? .timeout : .otherSystemReason
++                debugLog(cancellation.diagnostics.cancellation(origin))
 +                cancellation.cancel()
 +            }
 +        } catch {
++            debugLog(cancellation.diagnostics.cancellation(.runtimeError))
++            debugLog(cancellation.diagnostics.failure(error, unwrap: { ($0 as? ALTWrappedError)?.wrappedError }))
 +            // Even a runtime-extension failure must not return a legitimate
 +            // ticket before its backend is cancelled and joined. OS process
 +            // termination cannot run this code; the journal keeps that distinct.
@@ -1144,10 +1861,10 @@ index 00000000..8f8d2baa
 +}
 diff --git a/SideStore/Core/Automation/AutomationRefreshPolicy.swift b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
 new file mode 100644
-index 00000000..7a948b23
+index 0000000..6d2c57b
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationRefreshPolicy.swift
-@@ -0,0 +1,337 @@
+@@ -0,0 +1,479 @@
 +import Foundation
 +
 +/// The shortcut obtains a lease before changing VPNs and releases it only AFTER
@@ -1485,18 +2202,747 @@ index 00000000..7a948b23
 +        ISO8601DateFormatter().string(from: date)
 +    }
 +}
++
++// Error identity is deliberately independent of UI presentation wrappers.
++// The Evidence file's former declaration is removed by the integration owner.
++struct AutomationFailure: Error, Sendable, CustomNSError {
++    let code: String
++    init(_ code: String) { self.code = code }
++
++    static let errorDomain = "SideStore.Automation"
++    static let codeKey = "SideStoreAutomationFailureCode"
++    var errorCode: Int { 1 }
++    var errorUserInfo: [String: Any] {
++        [Self.codeKey: AutomationDiagnosticPrivacy.businessCode(code) ?? "unclassifiedAutomationFailure"]
++    }
++
++    static func recoveredCode(from error: Error,
++                              unwrap: ((NSError) -> NSError?)? = nil) -> String? {
++        if let original = error as? AutomationFailure {
++            return AutomationDiagnosticPrivacy.businessCode(original.code) ?? "unclassifiedAutomationFailure"
++        }
++        for item in AutomationDiagnosticPrivacy.errorChain(error, unwrap: unwrap) {
++            if item.domain == errorDomain,
++               let code = item.userInfo[codeKey] as? String,
++               let safe = AutomationDiagnosticPrivacy.businessCode(code) { return safe }
++        }
++        return nil
++    }
++
++    static func isCancellation(_ error: Error,
++                               unwrap: ((NSError) -> NSError?)? = nil) -> Bool {
++        if error is CancellationError { return true }
++        let cancellationDomain = (CancellationError() as NSError).domain
++        return AutomationDiagnosticPrivacy.errorChain(error, unwrap: unwrap)
++            .contains { $0.domain == cancellationDomain }
++    }
++}
++
++enum AutomationDiagnosticStage: String, Sendable, CaseIterable {
++    case intentRuntime, databaseStartup, deviceConnection, teamResolution
++    case sessionPreparation, targetSelection, rustdeskPipeline, sidestorePipeline
++    case rustdeskReadback, sidestoreReadback, verifiedTerminal
++
++    var fallbackCode: String {
++        switch self {
++        case .intentRuntime: "intentRuntimeFailed"
++        case .databaseStartup: "databaseStartupFailed"
++        case .deviceConnection: "networkReadinessFailed"
++        case .teamResolution: "teamResolutionFailed"
++        case .sessionPreparation: "sessionPreparationFailed"
++        case .targetSelection: "targetSelectionFailed"
++        case .rustdeskPipeline: "rustdeskPipelineFailed"
++        case .sidestorePipeline: "sidestorePipelineFailed"
++        case .rustdeskReadback: "profileReadbackUnexpectedFailure"
++        case .sidestoreReadback: "profileReadbackUnexpectedFailure"
++        case .verifiedTerminal: "terminalPersistenceFailed"
++        }
++    }
++}
++
++enum AutomationCancellationOrigin: String, Sendable {
++    case userCancelled, timeout, otherSystemReason, parentTaskCancelled, runtimeError
++}
++
++enum AutomationDiagnosticPrivacy {
++    // Values originate in source-defined checks. Never serialize an arbitrary
++    // Error description, userInfo, account/server response, URL, or identifier.
++    private static let businessCodes: Set<String> = [
++        "anotherOperationActive", "cachedBundleIdentityMismatch", "cachedSigningIdentityMismatch", "cellularRefreshMustBeDisabled",
++        "completionIdentityMismatch", "duplicateProfile", "emptyOrMismatchedResult",
++        "extensionIdentityUnavailable", "invalidCompletionCount", "invalidJournal",
++        "managedObjectContextMismatch", "missingBackendTask", "missingJournalLease",
++        "missingOrAmbiguousTarget", "missingTargetCompletion", "nativeInstallEvidenceMissing",
++        "networkReadinessTimedOut", "networkReadinessUnverified", "networkReadinessFailed",
++        "pairingNotReady", "deviceLocked", "journalUnavailable",
++        "preparedRecoveryBackupFailed", "preparedRecoveryEvidenceChanged",
++        "profileIdentityMismatch", "profilePlanMismatch", "profileReadbackDirectoryInvalid",
++        "profileReadbackDirectoryUnavailable", "profileReadbackDuplicateUUID",
++        "profileReadbackExpectedProfileMissing", "profileReadbackExportEmpty",
++        "profileReadbackExportIncomplete", "profileReadbackFileChanged",
++        "profileReadbackFileInvalid", "profileReadbackFileUnavailable",
++        "profileReadbackFormatUnsupported", "profileReadbackHashMismatch",
++        "profileReadbackIdentityMismatch", "profileReadbackLimitExceeded",
++        "profileReadbackNativeFailed", "profileReadbackUnexpectedFailure",
++        "rustdeskIdentityMismatch", "sidestoreIdentityMismatch",
++        "targetOrSigningIdentityUnavailable", "unexpectedAutomationOperation",
++        "deviceProfileVerificationUnavailable", "existingSigningCertificateUnavailable", "unclassifiedAutomationFailure"
++    ]
++
++    static func businessCode(_ value: String) -> String? {
++        businessCodes.contains(value) ? value : nil
++    }
++
++    static func errorChain(_ error: Error,
++                           unwrap: ((NSError) -> NSError?)? = nil) -> [NSError] {
++        var result: [NSError] = []
++        var next: NSError? = error as NSError
++        var seen = Set<ObjectIdentifier>()
++        while let item = next, result.count < 4, seen.insert(ObjectIdentifier(item)).inserted {
++            result.append(item)
++            next = unwrap?(item) ?? item.userInfo[NSUnderlyingErrorKey] as? NSError
++        }
++        return result
++    }
++
++    static func domainLabel(_ domain: String) -> String {
++        switch domain {
++        case AutomationFailure.errorDomain, NSCocoaErrorDomain, NSURLErrorDomain,
++             NSPOSIXErrorDomain, NSOSStatusErrorDomain, NSMachErrorDomain,
++             "kCFErrorDomainCFNetwork", "NSNetServicesErrorDomain",
++             "SideStore.OperationError", "SideStore.AppleDeveloperError",
++             "AltSign.AppleDeveloperError", "com.rileytestut.AltSign": domain
++        default: domain == (CancellationError() as NSError).domain ? "CancellationError" : "other"
++        }
++    }
++}
++
++/// Volatile, non-Codable diagnostics. Existing persisted lease/report schemas
++/// remain unchanged. No run ID or application/account/profile identifier is kept.
++final class AutomationDiagnosticTrace: @unchecked Sendable {
++    private let lock = NSLock()
++    private var stage: AutomationDiagnosticStage = .intentRuntime
++
++    var currentStage: AutomationDiagnosticStage { lock.withLock { stage } }
++
++    @discardableResult
++    func enter(_ value: AutomationDiagnosticStage) -> String {
++        lock.withLock { stage = value }
++        return "[AutomationDiagnostic] event=stage phase=\(value.rawValue)"
++    }
++
++    func cancellation(_ origin: AutomationCancellationOrigin) -> String {
++        "[AutomationDiagnostic] event=cancel phase=\(currentStage.rawValue) reason=\(origin.rawValue)"
++    }
++
++    func failure(_ error: Error, unwrap: ((NSError) -> NSError?)? = nil) -> String {
++        let current = currentStage
++        let code = AutomationFailure.recoveredCode(from: error, unwrap: unwrap) ?? current.fallbackCode
++        let atoms = AutomationDiagnosticPrivacy.errorChain(error, unwrap: unwrap).map {
++            "\(AutomationDiagnosticPrivacy.domainLabel($0.domain)):\($0.code)"
++        }.joined(separator: ",")
++        return "[AutomationDiagnostic] event=failure phase=\(current.rawValue) code=\(code) errors=\(atoms)"
++    }
++}
+diff --git a/SideStore/Core/Automation/AutomationUpgradeStorage.swift b/SideStore/Core/Automation/AutomationUpgradeStorage.swift
+new file mode 100644
+index 0000000..4287c44
+--- /dev/null
++++ b/SideStore/Core/Automation/AutomationUpgradeStorage.swift
+@@ -0,0 +1,259 @@
++import Foundation
++import SQLite3
++import CryptoKit
++
++// This helper never reads Keychain/pairing and never removes a legacy source.
++// Receipts and snapshots remain beside the app's private database, never in CI.
++enum AutomationUpgradeStorageError: Error, Equatable {
++    case invalidLocation
++    case unsupportedEntry
++    case destinationConflict
++    case sourceChanged
++    case invalidReceipt
++    case invalidSQLite
++    case sqlite(stage: String, code: Int32)
++    case filesystem(stage: String, code: Int)
++    case maintenanceBusy
++    case invalidCounter
++    case fingerprintUnavailable
++    case certificateInvalid
++    case certificateSerialConflict
++}
++
++enum AutomationUpgradeStorage {
++    private struct SourceStamp: Codable, Equatable {
++        var main: String
++        var wal: String?
++    }
++    private struct Receipt: Codable {
++        var version: Int
++        var phase: String
++        var sourceName: String
++        var destinationName: String
++        var sourceStamp: SourceStamp
++        var snapshotName: String
++        var snapshotSHA256: String
++    }
++    private struct Entry: Equatable {
++        var path: String
++        var directory: Bool
++        var sha256: String?
++    }
++
++    static func fileSHA256(_ url: URL) throws -> String {
++        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
++        guard values.isRegularFile == true && values.isSymbolicLink != true else {
++            throw AutomationUpgradeStorageError.unsupportedEntry
++        }
++        let input = try FileHandle(forReadingFrom: url)
++        defer { try? input.close() }
++        var hash = SHA256()
++        while let data = try input.read(upToCount: 64 * 1024), !data.isEmpty { hash.update(data: data) }
++        return hash.finalize().map { String(format: "%02x", $0) }.joined()
++    }
++
++    private static func manifest(_ root: URL) throws -> [Entry] {
++        let values = try root.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
++        guard values.isSymbolicLink != true else { throw AutomationUpgradeStorageError.unsupportedEntry }
++        if values.isRegularFile == true {
++            return [Entry(path: ".", directory: false, sha256: try fileSHA256(root))]
++        }
++        guard values.isDirectory == true else { throw AutomationUpgradeStorageError.unsupportedEntry }
++        var result = [Entry(path: ".", directory: true, sha256: nil)]
++        func visit(_ directory: URL, relative: String) throws {
++            for item in try FileManager.default.contentsOfDirectory(
++                at: directory, includingPropertiesForKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
++            ).sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
++                let name = relative.isEmpty ? item.lastPathComponent : relative + "/" + item.lastPathComponent
++                let info = try item.resourceValues(forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey])
++                guard info.isSymbolicLink != true else { throw AutomationUpgradeStorageError.unsupportedEntry }
++                if info.isDirectory == true {
++                    result.append(Entry(path: name, directory: true, sha256: nil))
++                    try visit(item, relative: name)
++                } else if info.isRegularFile == true {
++                    result.append(Entry(path: name, directory: false, sha256: try fileSHA256(item)))
++                } else {
++                    throw AutomationUpgradeStorageError.unsupportedEntry
++                }
++            }
++        }
++        try visit(root, relative: "")
++        return result.sorted { $0.path < $1.path }
++    }
++
++    static func verifiedCopy(source: URL, destination: URL) throws {
++        guard source.standardizedFileURL != destination.standardizedFileURL else {
++            throw AutomationUpgradeStorageError.invalidLocation
++        }
++        let expected = try manifest(source)
++        let fm = FileManager.default
++        if fm.fileExists(atPath: destination.path) {
++            guard try manifest(destination) == expected else { throw AutomationUpgradeStorageError.destinationConflict }
++            return
++        }
++        let parent = destination.deletingLastPathComponent()
++        try fm.createDirectory(at: parent, withIntermediateDirectories: true)
++        let staging = parent.appendingPathComponent(".upgrade-copy-" + UUID().uuidString)
++        var ownStaging = false
++        defer { if ownStaging { try? fm.removeItem(at: staging) } }
++        ownStaging = true
++        try fm.copyItem(at: source, to: staging)
++        guard try manifest(staging) == expected && manifest(source) == expected else {
++            throw AutomationUpgradeStorageError.sourceChanged
++        }
++        // Same-directory publication; an existing destination is never replaced.
++        try fm.moveItem(at: staging, to: destination)
++        ownStaging = false
++        guard try manifest(destination) == expected else { throw AutomationUpgradeStorageError.destinationConflict }
++    }
++
++    private static func stamp(_ source: URL) throws -> SourceStamp {
++        let wal = URL(fileURLWithPath: source.path + "-wal")
++        return SourceStamp(main: try fileSHA256(source),
++            wal: FileManager.default.fileExists(atPath: wal.path) ? try fileSHA256(wal) : nil)
++    }
++
++    private static func open(_ url: URL, flags: Int32) throws -> OpaquePointer {
++        var connection: OpaquePointer?
++        let result = sqlite3_open_v2(url.path, &connection, flags | SQLITE_OPEN_FULLMUTEX, nil)
++        guard result == SQLITE_OK, let connection else {
++            if let connection { sqlite3_close(connection) }
++            throw AutomationUpgradeStorageError.sqlite(stage: "open", code: result)
++        }
++        sqlite3_busy_timeout(connection, 2_000)
++        return connection
++    }
++
++    private static func execute(_ db: OpaquePointer, _ sql: String, stage: String) throws {
++        let result = sqlite3_exec(db, sql, nil, nil, nil)
++        guard result == SQLITE_OK else { throw AutomationUpgradeStorageError.sqlite(stage: stage, code: result) }
++    }
++
++    private static func singleText(_ db: OpaquePointer, _ sql: String) throws -> String {
++        var statement: OpaquePointer?
++        let result = sqlite3_prepare_v2(db, sql, -1, &statement, nil)
++        guard result == SQLITE_OK, let statement else {
++            throw AutomationUpgradeStorageError.sqlite(stage: "prepareCheck", code: result)
++        }
++        defer { sqlite3_finalize(statement) }
++        let step = sqlite3_step(statement)
++        guard step == SQLITE_ROW, let text = sqlite3_column_text(statement, 0) else {
++            throw AutomationUpgradeStorageError.sqlite(stage: "readCheck", code: step)
++        }
++        return String(cString: text)
++    }
++
++    static func validateSQLite(_ url: URL) throws {
++        let connection = try open(url, flags: SQLITE_OPEN_READONLY)
++        defer { sqlite3_close(connection) }
++        guard try singleText(connection, "PRAGMA quick_check") == "ok" else {
++            throw AutomationUpgradeStorageError.invalidSQLite
++        }
++    }
++
++    private static func backup(_ source: OpaquePointer, to destination: URL) throws {
++        let target = try open(destination, flags: SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
++        defer { sqlite3_close(target) }
++        guard let backup = sqlite3_backup_init(target, "main", source, "main") else {
++            throw AutomationUpgradeStorageError.sqlite(stage: "backupInit", code: sqlite3_errcode(target))
++        }
++        var finished = false
++        defer { if !finished { sqlite3_backup_finish(backup) } }
++        let deadline = ProcessInfo.processInfo.systemUptime + 5
++        while true {
++            let result = sqlite3_backup_step(backup, 128)
++            if result == SQLITE_DONE { break }
++            guard result == SQLITE_OK || result == SQLITE_BUSY || result == SQLITE_LOCKED else {
++                throw AutomationUpgradeStorageError.sqlite(stage: "backupStep", code: result)
++            }
++            guard ProcessInfo.processInfo.systemUptime < deadline else {
++                throw AutomationUpgradeStorageError.sqlite(stage: "backupDeadline", code: result)
++            }
++            if result != SQLITE_OK { sqlite3_sleep(20) }
++        }
++        let result = sqlite3_backup_finish(backup)
++        finished = true
++        guard result == SQLITE_OK else { throw AutomationUpgradeStorageError.sqlite(stage: "backupFinish", code: result) }
++        guard try singleText(target, "PRAGMA journal_mode=DELETE") == "delete",
++              try singleText(target, "PRAGMA quick_check") == "ok" else {
++            throw AutomationUpgradeStorageError.invalidSQLite
++        }
++    }
++
++    private static func writeReceipt(_ receipt: Receipt, to url: URL) throws {
++        let data = try JSONEncoder().encode(receipt)
++        try data.write(to: url, options: .atomic)
++        guard try Data(contentsOf: url) == data else { throw AutomationUpgradeStorageError.invalidReceipt }
++    }
++
++    static func preserveSQLite(source: URL, destination: URL) throws {
++        let fm = FileManager.default
++        let parent = destination.deletingLastPathComponent().standardizedFileURL
++        guard source.standardizedFileURL != destination.standardizedFileURL,
++              source.deletingLastPathComponent().standardizedFileURL == parent else {
++            throw AutomationUpgradeStorageError.invalidLocation
++        }
++        let receiptURL = parent.appendingPathComponent("." + destination.lastPathComponent + ".upgrade-receipt.json")
++        let snapshots = parent.appendingPathComponent(".upgrade-preservation", isDirectory: true)
++        if fm.fileExists(atPath: destination.path) {
++            guard let data = try? Data(contentsOf: receiptURL),
++                  var receipt = try? JSONDecoder().decode(Receipt.self, from: data),
++                  receipt.version == 1, ["prepared", "committed"].contains(receipt.phase),
++                  receipt.sourceName == source.lastPathComponent,
++                  receipt.destinationName == destination.lastPathComponent,
++                  UUID(uuidString: (receipt.snapshotName as NSString).deletingPathExtension) != nil,
++                  (receipt.snapshotName as NSString).pathExtension == "sqlite",
++                  (receipt.snapshotName as NSString).lastPathComponent == receipt.snapshotName else {
++                throw AutomationUpgradeStorageError.invalidReceipt
++            }
++            let snapshot = snapshots.appendingPathComponent(receipt.snapshotName)
++            guard try stamp(source) == receipt.sourceStamp,
++                  try fileSHA256(snapshot) == receipt.snapshotSHA256 else {
++                throw AutomationUpgradeStorageError.sourceChanged
++            }
++            try validateSQLite(destination)
++            if receipt.phase == "prepared" {
++                guard try fileSHA256(destination) == receipt.snapshotSHA256 else {
++                    throw AutomationUpgradeStorageError.destinationConflict
++                }
++                receipt.phase = "committed"
++                try writeReceipt(receipt, to: receiptURL)
++            }
++            return
++        }
++        // No new database is published until the read snapshot is complete.
++        let reader = try open(source, flags: SQLITE_OPEN_READONLY)
++        defer { sqlite3_close(reader) }
++        try execute(reader, "BEGIN", stage: "beginRead")
++        defer { sqlite3_exec(reader, "ROLLBACK", nil, nil, nil) }
++        _ = try singleText(reader, "SELECT count(*) FROM sqlite_schema")
++        let before = try stamp(source)
++        try fm.createDirectory(at: snapshots, withIntermediateDirectories: true)
++        let snapshot = snapshots.appendingPathComponent(UUID().uuidString + ".sqlite")
++        try backup(reader, to: snapshot)
++        guard try stamp(source) == before else { throw AutomationUpgradeStorageError.sourceChanged }
++        let snapshotHash = try fileSHA256(snapshot)
++        var receipt = Receipt(version: 1, phase: "prepared", sourceName: source.lastPathComponent,
++            destinationName: destination.lastPathComponent, sourceStamp: before,
++            snapshotName: snapshot.lastPathComponent, snapshotSHA256: snapshotHash)
++        try writeReceipt(receipt, to: receiptURL)
++        try verifiedCopy(source: snapshot, destination: destination)
++        try validateSQLite(destination)
++        receipt.phase = "committed"
++        try writeReceipt(receipt, to: receiptURL)
++    }
++
++    static func readCounter(at url: URL, maximum: Int) throws -> Int {
++        guard FileManager.default.fileExists(atPath: url.path) else { return 0 }
++        guard let value = Int(try String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines)),
++              value >= 0 && value <= maximum else { throw AutomationUpgradeStorageError.invalidCounter }
++        return value
++    }
++
++    static func writeCounter(_ value: Int, at url: URL) throws {
++        try Data(String(value).utf8).write(to: url, options: .atomic)
++        guard try readCounter(at: url, maximum: value) == value else {
++            throw AutomationUpgradeStorageError.invalidCounter
++        }
++    }
++}
+diff --git a/SideStore/Core/Bonjour/BonjourDiscoveryManager.swift b/SideStore/Core/Bonjour/BonjourDiscoveryManager.swift
+index e2d08c3..a1c2a95 100644
+--- a/SideStore/Core/Bonjour/BonjourDiscoveryManager.swift
++++ b/SideStore/Core/Bonjour/BonjourDiscoveryManager.swift
+@@ -714,174 +714,165 @@ final class BonjourDiscoveryManager: NSObject, ObservableObject, NetServiceDeleg
+         return addresses
+     }
+     
+-    private final class OneShotResolver: @unchecked Sendable {
++
++    /// Resolve the advertised SRV record, never a connection's local source port.
++    private final class OneShotResolver: NSObject, NetServiceDelegate, @unchecked Sendable {
+         private let lock = NSLock()
+-        private var isResumed = false
++        private var finished = false
++        private var resolving = false
++        private let requiresPreferredCandidate: Bool
++        private var latestCandidate: String?
++        private var selectedCandidate: String?
+         private var browser: NWBrowser?
+-        private var activeConnection: NWConnection?
++        private var service: NetService?
+         private var continuation: CheckedContinuation<(host: String, port: UInt16)?, Never>?
+-        
+-        init(continuation: CheckedContinuation<(host: String, port: UInt16)?, Never>) {
+-            self.continuation = continuation
++
++        init(requiresPreferredCandidate: Bool) {
++            self.requiresPreferredCandidate = requiresPreferredCandidate
++            super.init()
+         }
+-        
+-        func setBrowser(_ browser: NWBrowser) {
++
++        func observeCandidate(_ key: String?) {
+             lock.lock()
+-            self.browser = browser
++            latestCandidate = key
++            let invalidate = requiresPreferredCandidate && resolving && selectedCandidate != key
+             lock.unlock()
++            if invalidate { resumeOnce(nil) }
+         }
+-        
+-        func setActiveConnection(_ connection: NWConnection) {
++
++        func attach(_ value: CheckedContinuation<(host: String, port: UInt16)?, Never>, browser: NWBrowser) -> Bool {
+             lock.lock()
+-            self.activeConnection = connection
++            if finished {
++                lock.unlock()
++                value.resume(returning: nil)
++                return false
++            }
++            continuation = value
++            self.browser = browser
+             lock.unlock()
++            return true
+         }
+-        
+-        func resumeOnce(_ result: (host: String, port: UInt16)?) {
++
++        func startBrowser() {
++            lock.lock()
++            defer { lock.unlock() }
++            guard !finished else { return }
++            browser?.start(queue: .global(qos: .userInitiated))
++        }
++
++        func resolve(name: String, type: String, domain: String, key: String, timeout: TimeInterval) {
+             lock.lock()
+-            guard !isResumed else {
++            guard !finished && !resolving && (!requiresPreferredCandidate || latestCandidate == key) else {
+                 lock.unlock()
+                 return
+             }
+-            isResumed = true
+-            let continuation = self.continuation
+-            self.continuation = nil
+-            let browser = self.browser
+-            self.browser = nil
+-            let connection = self.activeConnection
+-            self.activeConnection = nil
++            resolving = true
++            selectedCandidate = key
+             lock.unlock()
+-            
+-            browser?.cancel()
+-            connection?.cancel()
+-            continuation?.resume(returning: result)
++            DispatchQueue.main.async {
++                self.lock.lock()
++                guard !self.finished else { self.lock.unlock(); return }
++                let normalizedDomain = domain.isEmpty ? "local." : domain.hasSuffix(".") ? domain : domain + "."
++                let normalizedType = type.hasSuffix(".") ? type : type + "."
++                let value = NetService(domain: normalizedDomain, type: normalizedType, name: name)
++                value.delegate = self
++                self.service = value
++                self.lock.unlock()
++                value.resolve(withTimeout: timeout)
++            }
++        }
++
++        func netServiceDidResolveAddress(_ sender: NetService) {
++            guard (1...65535).contains(sender.port), let host = sender.hostName, !host.isEmpty else {
++                resumeOnce(nil)
++                return
++            }
++            // NetService.port is the advertised service's listening port.
++            // localEndpoint.port belongs to our outgoing socket and is unusable here.
++            debugLog("[BonjourDiscovery] SRV service port resolved: \(sender.port)")
++            resumeOnce((host: host, port: UInt16(sender.port)))
++        }
++
++        func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
++            debugLog("[BonjourDiscovery] SRV service resolution failed")
++            resumeOnce(nil)
++        }
++
++        func resumeOnce(_ result: (host: String, port: UInt16)?) {
++            lock.lock()
++            guard !finished else { lock.unlock(); return }
++            finished = true
++            let callback = continuation
++            continuation = nil
++            let activeBrowser = browser
++            browser = nil
++            let activeService = service
++            service = nil
++            let accepted = requiresPreferredCandidate && selectedCandidate != latestCandidate ? nil : result
++            lock.unlock()
++            activeBrowser?.cancel()
++            if let activeService {
++                DispatchQueue.main.async {
++                    activeService.stop()
++                    activeService.delegate = nil
++                }
++            }
++            callback?.resume(returning: accepted)
+         }
+     }
+-    
++
+     static func resolveFirstService(
+         ofType rawType: String,
+         namePrefix: String = "",
+         domain: String? = nil,
+-        timeout: TimeInterval = AppConstants.Bonjour.defaultDiscoveryTimeout
++        timeout: TimeInterval = AppConstants.Bonjour.defaultDiscoveryTimeout,
++        isPreferredCandidate: (@Sendable (NWBrowser.Result) -> Bool)? = nil,
++        requirePreferredCandidate: Bool = false
+     ) async -> (host: String, port: UInt16)? {
+-        let typeWithoutDot = rawType.hasSuffix(".") ? String(rawType.dropLast()) : rawType
+-        let descriptor = NWBrowser.Descriptor.bonjour(type: typeWithoutDot, domain: domain)
+-        let parameters = typeWithoutDot.contains("_tcp") ? NWParameters.tcp : NWParameters.udp
++        let type = rawType.hasSuffix(".") ? String(rawType.dropLast()) : rawType
++        let descriptor = NWBrowser.Descriptor.bonjour(type: type, domain: domain)
++        let parameters = type.contains("_tcp") ? NWParameters.tcp : NWParameters.udp
+         parameters.includePeerToPeer = true
+-        
+-        debugLog("[BonjourDiscovery] resolveFirstService: starting NWBrowser for type='\(typeWithoutDot)', namePrefix='\(namePrefix)', domain=\(domain ?? "nil") (timeout: \(timeout)s)")
+         let browser = NWBrowser(for: descriptor, using: parameters)
+-        
+-        return await withCheckedContinuation { continuation in
+-            let resolver = OneShotResolver(continuation: continuation)
+-            resolver.setBrowser(browser)
+-            
+-            Task {
+-                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+-                debugLog("[BonjourDiscovery] resolveFirstService: timeout reached after \(timeout)s")
+-                resolver.resumeOnce(nil)
+-            }
+-            
+-            browser.browseResultsChangedHandler = { results, changes in
+-                debugLog("[BonjourDiscovery] resolveFirstService: received \(results.count) results (changes: \(changes.count))")
+-                for res in results {
+-                    debugLog("[BonjourDiscovery] resolveFirstService: found endpoint '\(res.endpoint)' (interfaces: \(res.interfaces.map { $0.name }))")
+-                }
+-                
+-                let exactMatch = results.first(where: {
+-                    guard case .service(let name, _, _, _) = $0.endpoint else { return false }
+-                    return name.localizedCaseInsensitiveCompare(namePrefix) == .orderedSame
+-                })
+-                
+-                guard let target = exactMatch ?? results.first(where: {
+-                    guard case .service(let name, _, _, _) = $0.endpoint else { return false }
+-                    return namePrefix.isEmpty || name.localizedCaseInsensitiveContains(namePrefix)
+-                }), case .service(let name, _, _, _) = target.endpoint else {
+-                    debugLog("[BonjourDiscovery] resolveFirstService: no result matched prefix '\(namePrefix)'")
+-                    return
++        let resolver = OneShotResolver(requiresPreferredCandidate: requirePreferredCandidate)
++        return await withTaskCancellationHandler {
++            await withCheckedContinuation { continuation in
++                guard resolver.attach(continuation, browser: browser) else { return }
++                if Task.isCancelled { resolver.resumeOnce(nil); return }
++                Task {
++                    try? await Task.sleep(nanoseconds: UInt64(max(0.01, timeout) * 1_000_000_000))
++                    resolver.resumeOnce(nil)
+                 }
+-                
+-                debugLog("[BonjourDiscovery] resolveFirstService: matched service '\(name)', initiating NWConnection")
+-                let conn = NWConnection(to: target.endpoint, using: parameters)
+-                resolver.setActiveConnection(conn)
+-                
+-                conn.pathUpdateHandler = { path in
+-                    debugLog("[BonjourDiscovery] resolveFirstService: conn pathUpdate status=\(path.status), remote=\(String(describing: path.remoteEndpoint))")
+-                    if path.status == .satisfied, let remote = path.remoteEndpoint {
+-                        var resolvedHost = ""
+-                        var portVal: UInt16 = 0
+-                        
+-                        switch remote {
+-                        case .hostPort(let host, let port):
+-                            resolvedHost = "\(host)".strippingInterfaceScope
+-                            portVal = port.rawValue
+-                        case .service(let sName, _, let sDomain, _):
+-                            let cleanDomain = sDomain.isEmpty ? "local" : (sDomain.hasSuffix(".") ? String(sDomain.dropLast()) : sDomain)
+-                            resolvedHost = "\(sName).\(cleanDomain)"
+-                            if let localEndpoint = path.localEndpoint, case .hostPort(_, let p) = localEndpoint {
+-                                portVal = p.rawValue
+-                            }
+-                        default:
+-                            resolvedHost = name
+-                        }
+-                        
+-                        guard portVal > 0 else { return }
+-                        let ips = resolveHostToIPs(resolvedHost)
+-                        let finalHost = ips.first ?? resolvedHost
+-                        debugLog("[BonjourDiscovery] Auto-resolved '\(name)' via pathUpdate to \(finalHost):\(portVal)")
+-                        resolver.resumeOnce((host: finalHost, port: portVal))
++                browser.browseResultsChangedHandler = { results, _ in
++                    let matched = results.filter { result in
++                        guard case .service(let name, _, _, _) = result.endpoint else { return false }
++                        return namePrefix.isEmpty || name.localizedCaseInsensitiveContains(namePrefix)
+                     }
+-                }
+-                
+-                conn.stateUpdateHandler = { state in
+-                    debugLog("[BonjourDiscovery] resolveFirstService: conn stateUpdate -> \(state)")
+-                    switch state {
+-                    case .ready, .waiting:
+-                        guard let remote = conn.currentPath?.remoteEndpoint else { return }
+-                        var resolvedHost = ""
+-                        var portVal: UInt16 = 0
+-                        
+-                        switch remote {
+-                        case .hostPort(let host, let port):
+-                            resolvedHost = "\(host)".strippingInterfaceScope
+-                            portVal = port.rawValue
+-                        case .service(let sName, _, let sDomain, _):
+-                            let cleanDomain = sDomain.isEmpty ? "local" : (sDomain.hasSuffix(".") ? String(sDomain.dropLast()) : sDomain)
+-                            resolvedHost = "\(sName).\(cleanDomain)"
+-                            if let localEndpoint = conn.currentPath?.localEndpoint, case .hostPort(_, let p) = localEndpoint {
+-                                portVal = p.rawValue
+-                            }
+-                        default:
+-                            resolvedHost = name
+-                        }
+-                        
+-                        guard portVal > 0 else { return }
+-                        let ips = resolveHostToIPs(resolvedHost)
+-                        let finalHost = ips.first ?? resolvedHost
+-                        debugLog("[BonjourDiscovery] Auto-resolved '\(name)' to \(finalHost):\(portVal)")
+-                        resolver.resumeOnce((host: finalHost, port: portVal))
+-                        
+-                    case .failed(let err):
+-                        debugLog("[BonjourDiscovery] resolveFirstService: conn failed with error: \(err)")
+-                        resolver.resumeOnce(nil)
+-                        
+-                    default:
+-                        break
++                    let preferred = isPreferredCandidate.map { predicate in matched.filter(predicate) } ?? []
++                    let selected: NWBrowser.Result?
++                    if requirePreferredCandidate {
++                        // Multiple local advertisements are ambiguous; wait for a
++                        // definitive browse update or the bounded timeout.
++                        guard preferred.count == 1 else { resolver.observeCandidate(nil); return }
++                        selected = preferred.first
++                    } else {
++                        selected = preferred.first ?? matched.first(where: {
++                            guard case .service(let name, _, _, _) = $0.endpoint else { return false }
++                            return name.localizedCaseInsensitiveCompare(namePrefix) == .orderedSame
++                        }) ?? matched.first
+                     }
++                    guard let selected, case .service(let name, let selectedType, let selectedDomain, _) = selected.endpoint else { return }
++                    let key = name + "|" + selectedType + "|" + selectedDomain
++                    resolver.observeCandidate(key)
++                    resolver.resolve(name: name, type: selectedType, domain: selectedDomain, key: key, timeout: timeout)
+                 }
+-                
+-                conn.start(queue: .global(qos: .userInitiated))
+-            }
+-            
+-            browser.stateUpdateHandler = { state in
+-                debugLog("[BonjourDiscovery] resolveFirstService: browser stateUpdate -> \(state)")
+-                if case .failed(let err) = state {
+-                    debugLog("[BonjourDiscovery] resolveFirstService: browser failed with error: \(err)")
+-                    resolver.resumeOnce(nil)
++                browser.stateUpdateHandler = { state in
++                    if case .failed = state { resolver.resumeOnce(nil) }
+                 }
++                resolver.startBrowser()
+             }
+-            
+-            browser.start(queue: .global(qos: .userInitiated))
++        } onCancel: {
++            resolver.resumeOnce(nil)
+         }
+     }
+ }
+diff --git a/SideStore/Core/DeviceApi/MinimuxerWrapper.swift b/SideStore/Core/DeviceApi/MinimuxerWrapper.swift
+index 40b53aa..019a38d 100644
+--- a/SideStore/Core/DeviceApi/MinimuxerWrapper.swift
++++ b/SideStore/Core/DeviceApi/MinimuxerWrapper.swift
+@@ -56,7 +56,11 @@ private func resolveDiscoveredRemotePairingPort() async -> UInt16? {
+     }
+     if let resolved = await BonjourDiscoveryManager.resolveFirstService(
+         ofType: AppConstants.Minimuxer.remotePairingDaemonServiceType,
+-        timeout: AppConstants.Bonjour.defaultDiscoveryTimeout
++        timeout: AppConstants.Bonjour.defaultDiscoveryTimeout,
++        isPreferredCandidate: { res in
++            res.interfaces.contains { $0.name == "lo0" || $0.name.hasPrefix("lo") }
++        },
++        requirePreferredCandidate: true
+     ) {
+         debugLog("[SideStore] Discovered RemotePairing port via Bonjour: \(resolved.port)")
+         UserDefaults.standard.lastDiscoveredRemotePairingPort = Int(resolved.port)
 diff --git a/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift b/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift
-index 64b31937..05b82483 100644
+index 1c83b0f..70836f4 100644
 --- a/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift
 +++ b/SideStore/Core/Operations/PipelineOperations/PreflightChecksOperation.swift
-@@ -49,6 +49,17 @@ final class PreflightChecksOperation: BasePipelineOperation<StandaloneOperationC
+@@ -49,6 +49,14 @@ final class PreflightChecksOperation: BasePipelineOperation<StandaloneOperationC
              guard isSideStore else { continue }
              guard let installedApp = operation.app as? InstalledApp else { continue }
  
 +            if AutomationProfileEvidence.current != nil, case .refresh = operation {
-+                // Ordinary .refresh never offers a resign/mismatch dialog. For
-+                // this explicit automation path, validate the self identity on
-+                // its owning queue and leave all other operations unchanged.
 +                let matches = await self.context.dbBackgroundContext.perform {
 +                    installedApp.resignedBundleIdentifier == Bundle.main.bundleIdentifier
 +                }
@@ -1508,21 +2954,21 @@ index 64b31937..05b82483 100644
              let activeEffectiveID = installedApp.customBundleIdentifier ?? activeResignedID
  
 diff --git a/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift b/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift
-index cebf3617..e5cdc609 100644
+index bf23bf8..3fda69d 100644
 --- a/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift
 +++ b/SideStore/Core/Operations/PipelineOperations/RefreshAppOperation.swift
-@@ -24,6 +24,10 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
-         guard let profiles = self.context.provisioningProfiles else {
-             throw OperationError.invalidParameters("RefreshAppOperation.execute: self.context.provisioningProfiles is nil")
+@@ -28,6 +28,10 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
+         guard let appBundle = self.context.targetAppBundle else {
+             throw OperationError.invalidParameters("RefreshAppOperation: context.targetAppBundle is nil")
          }
 +        guard profiles[self.context.targetBundleIdentifier] != nil else {
 +            throw OperationError.invalidParameters("RefreshAppOperation: main provisioning profile is missing.")
 +        }
 +        try AutomationProfileEvidence.current?.plan(profiles, mainKey: self.context.targetBundleIdentifier)
-         
-         guard let appBundle = self.context.targetAppBundle else { throw OperationError.appNotFound(name: nil) }
          self.setProgress(10)
-@@ -31,7 +35,9 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
+         
+         if self.context.isCellularRefreshGroup {
+@@ -48,7 +52,9 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
          do {
              await CellularRefreshManager.shared.turnOffDataIfNeeded()
              for p in profiles {
@@ -1532,9 +2978,9 @@ index cebf3617..e5cdc609 100644
              }
              await CellularRefreshManager.shared.turnOnDataIfNeeded()
          } catch {
-@@ -57,7 +63,10 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
+@@ -74,7 +80,10 @@ final class RefreshAppOperation: BasePipelineOperation<InstallAppOperationContex
                let installedApp = dbContext.object(with: mainApp.objectID) as? InstalledApp else {
-             throw OperationError.appNotFound(name: appBundle.name)
+             throw OperationError.invalidParameters("Could not find installed database record for '\(appBundle.name)'")
          }
 -        installedApp.update(provisioningProfile: profiles.values.first!)
 +        guard let mainProfile = profiles[self.context.targetBundleIdentifier] else {
@@ -1545,92 +2991,428 @@ index cebf3617..e5cdc609 100644
          if let certStatus = self.context.targetCertStatus {
              installedApp.certificateStatus = certStatus
 diff --git a/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift b/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift
-index 192ef75c..01776a2a 100644
+index 8941157..ce9c664 100644
 --- a/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift
 +++ b/SideStore/Core/Operations/PipelineOperations/UpdateAppCertificateOperation.swift
-@@ -21,6 +21,16 @@ final class UpdateAppCertificateOperation: BasePipelineOperation<InstallAppOpera
-             debugLog("[UpdateAppCertificateOperation] execute() took: \(String(format: "%.3fs", elapsed))")
+@@ -22,6 +22,15 @@ final class UpdateAppCertificateOperation: BasePipelineOperation<InstallAppOpera
          }
          try await super.executePreconditionCheck(parentProgress: parentProgress)
-+
+         
 +        if let evidence = AutomationProfileEvidence.current {
-+            // The automation target's binary signing serial was captured on its
-+            // MOC queue. Reuse an existing local identity only; do not create,
-+            // replace, revoke or export a certificate, or dereference the
-+            // InstalledApp from this executor.
-+            self.context.overrideSigningCertificate = CertificateManager.shared.getSignableCertificate(for: evidence.certificateSerial)
++            guard let certificate = CertificateManager.shared.getSignableCertificate(for: evidence.certificateSerial) else {
++                throw AutomationFailure("existingSigningCertificateUnavailable")
++            }
++            self.context.overrideSigningCertificate = certificate
 +            self.setProgress(100)
 +            return
 +        }
-         
-         if let installedApp = self.context.installedApp, let serialNumber = installedApp.certificateSerialNumber {
-             debugLog("[UpdateAppCertificateOperation] InstalledApp '\(installedApp.name)' has custom certificate serial: '\(serialNumber)'")
++
+         let targetBundleID = self.context.installedApp?.bundleIdentifier ?? self.context.targetBundleIdentifier
+         let profileToUse = self.context.overrideProvisioningProfile ?? ProfileManager.shared.getAssignedProfile(for: targetBundleID)
+ 
 diff --git a/SideStore/Core/Operations/PipelineRunner.swift b/SideStore/Core/Operations/PipelineRunner.swift
-index 0142c0cc..f46f6fe0 100644
+index a230498..8560f96 100644
 --- a/SideStore/Core/Operations/PipelineRunner.swift
 +++ b/SideStore/Core/Operations/PipelineRunner.swift
-@@ -214,11 +214,14 @@ final class PipelineRunner: Sendable
+@@ -243,14 +243,19 @@ final class PipelineRunner: Sendable
+         }
          do {
-             let result = try await self.performPipeline(for: operation, handler: handler, group: group)
-             progress.set(nil, for: operation)
--            debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(result.bundleIdentifier)")
--            
--            // persist the result
--            let bundleID = result.bundleIdentifier
-             let dbContext = group.context.dbBackgroundContext
+             let result = try await self.performPipeline(for: operation, handler: handler, group: group, operationsCount: operationsCount)
++            let dbContext = group.dbContext
 +            let bundleID: String
 +            if AutomationProfileEvidence.current != nil {
 +                bundleID = await dbContext.perform { result.bundleIdentifier }
-+            } else { bundleID = result.bundleIdentifier }
-+            debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(bundleID)")
-+
-+            // persist the result
++            } else {
++                bundleID = result.bundleIdentifier
++            }
+             if operationsCount <= 1 {
+                 progress.set(nil, for: operation)
+-                debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(result.bundleIdentifier)")
++                debugLog("[AppManager] performOperation: completed successfully. progress was reset for installedApp: \(bundleID)")
+             }
+             
+             // persist the result
+-            let bundleID = result.bundleIdentifier
+-            let dbContext = group.dbContext
              do {
                  try await dbContext.perform {
                      let hasChanges = dbContext.hasChanges
-@@ -241,7 +244,7 @@ final class PipelineRunner: Sendable
+@@ -260,6 +265,7 @@ final class PipelineRunner: Sendable
+                     debugLog("[AppManager] performOperation: Context changes were saved for installedApp: \(bundleID)")
+                 }
+             } catch {
++                if AutomationProfileEvidence.current != nil { throw error }
+                 debugLog("[AppManager] perform(): Failed to save InstalledApp to database. \(error.localizedDescription)")
+             }
+             
+@@ -273,7 +279,7 @@ final class PipelineRunner: Sendable
              await WidgetDataManager.publishCurrentInstalledApps(in: dbContext)
              debugLog("[AppManager] performOperation: Reloading COMPLETE for widget timelines.")
              
 -            if result.bundleIdentifier == StoreApp.altstoreAppID {
 +            if bundleID == StoreApp.altstoreAppID {
-                 let context = StandaloneOperationContext(steps: .scheduleExpirationWarningNotification, dbBackgroundContext: group.context.dbBackgroundContext)
+                 let context = StandaloneOperationContext(steps: .scheduleExpirationWarningNotification, dbBackgroundContext: group.dbContext)
                  let scheduleNotifOp = try ScheduleExpirationWarningNotificationOperation(
                      installedApp: result,
-@@ -289,10 +292,23 @@ final class PipelineRunner: Sendable
+@@ -306,7 +312,10 @@ final class PipelineRunner: Sendable
+             
+             logger.log(error, operation: operation.loggedErrorOperation, app: operation.app)
+             
+-            group.set(.failure(mappedError), forAppWithBundleIdentifier: operation.bundleIdentifier)
++            // Keep the ordinary UI's mapped title, but preserve typed failures for
++            // the explicit automation caller and its safe error-code report.
++            let completionError: Error = AutomationProfileEvidence.current == nil ? mappedError : error
++            group.set(.failure(completionError), forAppWithBundleIdentifier: operation.bundleIdentifier)
+         }
+     }
+     
+@@ -333,11 +342,25 @@ final class PipelineRunner: Sendable
          if case .resign(_,  let mode)     = operation { context.alternateIconMode       = mode }
          
          if let app = operation.app as? InstalledApp {
--            context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
+-            context.installedApp = app
+-            context.appBundleFingerprint = app.appBundleFingerprint
 -            context.useMainProfile = app.useMainProfile
 -            context.customBundleIdentifier = app.customBundleIdentifier
--            context.installedApp = app
+-            context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
 +            if AutomationProfileEvidence.current != nil {
 +                guard case .refresh = operation else { throw AutomationFailure("unexpectedAutomationOperation") }
-+                try await group.context.dbBackgroundContext.perform {
-+                    guard app.managedObjectContext === group.context.dbBackgroundContext else {
++                try await group.dbContext.perform {
++                    guard app.managedObjectContext === group.dbContext else {
 +                        throw AutomationFailure("managedObjectContextMismatch")
 +                    }
-+                    context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
++                    context.installedApp = app
++                    context.appBundleFingerprint = app.appBundleFingerprint
 +                    context.useMainProfile = app.useMainProfile
 +                    context.customBundleIdentifier = app.customBundleIdentifier
-+                    context.installedApp = app
++                    context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
 +                }
 +            } else {
-+                context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
++                context.installedApp = app
++                context.appBundleFingerprint = app.appBundleFingerprint
 +                context.useMainProfile = app.useMainProfile
 +                context.customBundleIdentifier = app.customBundleIdentifier
-+                context.installedApp = app
++                context.targetAppBundle = ALTApplication(fileURL: app.fileURL)
 +            }
          }
          
          context.beginInstallationHandler = { (installedApp) in
-@@ -300,7 +316,7 @@ final class PipelineRunner: Sendable
+diff --git a/SideStore/MaintenanceManager.swift b/SideStore/MaintenanceManager.swift
+index 1973baf..a2eca4b 100644
+--- a/SideStore/MaintenanceManager.swift
++++ b/SideStore/MaintenanceManager.swift
+@@ -1,198 +1,154 @@
+-//
+-//  MaintenanceManager.swift
+-//  SideStore
+-//
+-//  Created by Magesh K on 22/08/26.
+-//  Copyright © 2026 SideStore. All rights reserved.
+-//
+-
+ import Foundation
+ import CoreData
+ import SideSign
+ 
+-public final class MaintenanceManager {
+-    public static let shared = MaintenanceManager()
++private actor PreservationMaintenanceGate {
++    private var running = false
++    func begin() -> Bool {
++        guard !running else { return false }
++        running = true
++        return true
++    }
++    func end() { running = false }
++}
+ 
+-    // Increment this counter whenever you want to trigger another maintenance pass in future updates
++// Stored state is immutable except for the actor-protected admission flag.
++public final class MaintenanceManager: @unchecked Sendable {
++    public static let shared = MaintenanceManager()
+     public static let currentMaintenanceCounter = 5
+-
+     public static let maintenanceCounterFileName = ".maintenance_counter"
++    private let gate = PreservationMaintenanceGate()
++    private init() {}
+ 
+-    private var maintenanceCounterFileURL: URL? {
+-        FileManager.default.altstoreSharedDirectory?.appendingPathComponent(Self.maintenanceCounterFileName)
+-    }
+-
+-    private var completedCounter: Int {
+-        get {
+-            guard let url = maintenanceCounterFileURL,
+-                  let str = try? String(contentsOf: url, encoding: .utf8),
+-                  let val = Int(str.trimmingCharacters(in: .whitespacesAndNewlines)) else { return 0 }
+-            return val
+-        }
+-        set {
+-            guard let url = maintenanceCounterFileURL else { return }
+-            try? "\(newValue)".write(to: url, atomically: true, encoding: .utf8)
++    public func prepareForUse() async throws {
++        try await TaskChainCoalescer.shared.coalesce(key: "PersonalUpgradePreparation") { [self] in
++            try await performDatabaseMigrationIfNeeded()
++            try await DatabaseManager.shared.start()
++            try await performMaintenanceIfNeeded()
          }
-         
-         var downloadingApp = operation.app
--        if let installedApp = operation.app as? InstalledApp {
-+        if AutomationProfileEvidence.current == nil, let installedApp = operation.app as? InstalledApp {
-             if case .resign = operation { downloadingApp = installedApp }
-             else if let storeApp = installedApp.storeApp, !FileManager.default.fileExists(atPath: installedApp.fileURL.path) {
-                 downloadingApp = storeApp
+     }
+ 
+-    private init() {}
+-
+-    public func performDatabaseMigrationIfNeeded() async {
+-        let current = completedCounter
+-        guard current < Self.currentMaintenanceCounter else { return }
+-
+-        for pass in (current + 1)...Self.currentMaintenanceCounter {
+-            switch pass {
+-            case 4:
+-                await migrateDatabaseFiles()
+-            default:
+-                break
++    private var counterURL: URL {
++        get throws {
++            guard let directory = FileManager.default.altstoreSharedDirectory else {
++                throw AutomationUpgradeStorageError.invalidLocation
+             }
++            return directory.appendingPathComponent(Self.maintenanceCounterFileName)
+         }
+     }
+ 
+-    public func performMaintenanceIfNeeded() async {
+-        let current = completedCounter
+-        guard current < Self.currentMaintenanceCounter else { return }
+-
+-        for pass in (current + 1)...Self.currentMaintenanceCounter {
+-            debugLog("[MaintenanceManager] Running maintenance pass \(pass)...")
+-            switch pass {
+-            case 1:
+-                Keychain.shared.clearAll()
+-                await AuthManager.shared.signOut(keepCertificate: false, keepAnisetteData: false)
+-            case 2:
+-                AnisetteDataManager.shared.clearCache()
+-                await AuthManager.shared.signOut(keepCertificate: true, keepAnisetteData: false)
+-            case 3:
+-                UserDefaults.standard.tunnelOverridePeerIp = nil
+-            case 4:
+-                await migrateLegacyCachedAppBundles()
+-            case 5:
+-                await migrateLegacyCachedSigningCertificates()
+-            default:
+-                break
+-            }
++    public func performDatabaseMigrationIfNeeded() async throws {
++        guard await gate.begin() else { throw AutomationUpgradeStorageError.maintenanceBusy }
++        do {
++            let current = try AutomationUpgradeStorage.readCounter(at: counterURL, maximum: Self.currentMaintenanceCounter)
++            if current < 4 { try migrateDatabaseFiles() }
++            await gate.end()
++        } catch {
++            await gate.end()
++            throw error
+         }
+-
+-        completedCounter = Self.currentMaintenanceCounter
+-        debugLog("[MaintenanceManager] Maintenance up to counter \(Self.currentMaintenanceCounter) complete.")
+     }
+ 
+-}
+-
+-private extension MaintenanceManager {
+-    func migrateDatabaseFiles() async {
+-        let fileManager = FileManager.default
+-        let dbDir = PersistentContainer.defaultDirectoryURL()
+-
+-        let extensions = ["", "-wal", "-shm"]
+-        let legacyName = AppConstants.Database.legacyFileName
+-        let targetName = AppConstants.Database.fileName
+-
+-        let legacyTargetURL = dbDir.appendingPathComponent(legacyName)
+-        let newTargetURL = dbDir.appendingPathComponent(targetName)
+-
+-        if fileManager.fileExists(atPath: legacyTargetURL.path) && !fileManager.fileExists(atPath: newTargetURL.path) {
+-            for ext in extensions {
+-                let src = dbDir.appendingPathComponent("\(legacyName)\(ext)")
+-                let dst = dbDir.appendingPathComponent("\(targetName)\(ext)")
+-                if fileManager.fileExists(atPath: src.path) {
+-                    do {
+-                        try fileManager.moveItem(at: src, to: dst)
+-                        debugLog("[MaintenanceManager] Migrated database file '\(src.lastPathComponent)' -> '\(dst.lastPathComponent)'")
+-                    } catch {
+-                        debugLog("[MaintenanceManager] Failed to move database file '\(src.lastPathComponent)': \(error)")
++    public func performMaintenanceIfNeeded() async throws {
++        guard await gate.begin() else { throw AutomationUpgradeStorageError.maintenanceBusy }
++        do {
++            let current = try AutomationUpgradeStorage.readCounter(at: counterURL, maximum: Self.currentMaintenanceCounter)
++            if current < Self.currentMaintenanceCounter {
++                for pass in (current + 1)...Self.currentMaintenanceCounter {
++                    switch pass {
++                    case 1, 2, 3:
++                        // Personal upgrade: preserve existing auth, certificates,
++                        // Anisette initialization and routing even if counter is absent.
++                        debugLog("[MaintenanceManager] Preserved legacy initialization state.")
++                    case 4:
++                        try await migrateLegacyCachedAppBundles()
++                    case 5:
++                        try await migrateLegacyCachedSigningCertificates()
++                    default:
++                        throw AutomationUpgradeStorageError.invalidCounter
+                     }
++                    // A failed copy, verification or context save never reaches this write.
++                    try AutomationUpgradeStorage.writeCounter(pass, at: counterURL)
+                 }
+             }
++            await gate.end()
++        } catch {
++            await gate.end()
++            throw error
+         }
+     }
+ 
+-    // added in v0.7.0
+-    func migrateLegacyCachedAppBundles() async {
+-        let context = DatabaseManager.shared.viewContext
+-        await context.perform {
+-            let fetchRequest: NSFetchRequest<InstalledApp> = InstalledApp.fetchRequest()
+-            let installedApps = (try? context.fetch(fetchRequest)) ?? []
+-            let appsByBundleID = Dictionary(installedApps.map { ($0.resignedBundleIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
+-
+-            var didMutate = false
+-            let appsDir = InstalledApp.appsDirectoryURL
+-            guard let subdirectories = try? FileManager.default.contentsOfDirectory(
+-                at: appsDir,
+-                includingPropertiesForKeys: [.isDirectoryKey],
+-                options: [.skipsHiddenFiles]
+-            ) else {
+-                return
+-            }
+-
+-            for directory in subdirectories {
+-                guard directory.lastPathComponent != "Payloads" else { continue }
+-                let legacyAppURL = directory.appendingPathComponent("App.app")
+-                guard FileManager.default.fileExists(atPath: legacyAppURL.path) else { continue }
+-
+-                guard let signature = AppBundleFingerprint.compute(for: legacyAppURL) else {
+-                    debugLog("[MaintenanceManager] Failed to compute fingerprint for legacy app at '\(legacyAppURL.path)'")
+-                    continue
+-                }
+-
+-                let targetFileURL = InstalledApp.payloadURL(forSignature: signature)
+-                let targetParentDir = targetFileURL.deletingLastPathComponent()
++    private func migrateDatabaseFiles() throws {
++        let directory = PersistentContainer.defaultDirectoryURL()
++        let source = directory.appendingPathComponent(AppConstants.Database.legacyFileName)
++        let destination = directory.appendingPathComponent(AppConstants.Database.fileName)
++        if FileManager.default.fileExists(atPath: source.path) {
++            try AutomationUpgradeStorage.preserveSQLite(source: source, destination: destination)
++        } else if FileManager.default.fileExists(atPath: destination.path) {
++            try AutomationUpgradeStorage.validateSQLite(destination)
++        }
++    }
+ 
+-                do {
+-                    if !FileManager.default.fileExists(atPath: targetFileURL.path) {
+-                        try FileManager.default.createDirectory(at: targetParentDir, withIntermediateDirectories: true, attributes: nil)
+-                        try FileManager.default.moveItem(at: legacyAppURL, to: targetFileURL)
+-                    } else {
+-                        try FileManager.default.removeItem(at: legacyAppURL)
++    private func migrateLegacyCachedAppBundles() async throws {
++        let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
++        try await context.perform {
++            do {
++                let apps = try context.fetch(NSFetchRequest<InstalledApp>(entityName: "InstalledApp"))
++                let indexed = Dictionary(apps.map { ($0.resignedBundleIdentifier, $0) }, uniquingKeysWith: { first, _ in first })
++                let directories = try FileManager.default.contentsOfDirectory(
++                    at: InstalledApp.appsDirectoryURL, includingPropertiesForKeys: [.isDirectoryKey],
++                    options: [.skipsHiddenFiles]
++                )
++                for directory in directories where directory.lastPathComponent != "Payloads" {
++                    let source = directory.appendingPathComponent("App.app")
++                    guard FileManager.default.fileExists(atPath: source.path) else { continue }
++                    guard let fingerprint = AppBundleFingerprint.compute(for: source) else {
++                        throw AutomationUpgradeStorageError.fingerprintUnavailable
+                     }
+-
+-                    let bundleID = directory.lastPathComponent
+-                    if let app = appsByBundleID[bundleID] {
+-                        app.appBundleFingerprint = signature
+-                        didMutate = true
++                    let destination = InstalledApp.payloadURL(forSignature: fingerprint)
++                    try AutomationUpgradeStorage.verifiedCopy(source: source, destination: destination)
++                    guard AppBundleFingerprint.compute(for: destination) == fingerprint else {
++                        throw AutomationUpgradeStorageError.destinationConflict
+                     }
+-                    debugLog("[MaintenanceManager] Migrated legacy app bundle '\(bundleID)' to payload '\(signature)'.")
+-                } catch {
+-                    debugLog("[MaintenanceManager] Failed to move legacy app bundle at '\(legacyAppURL.path)': \(error)")
++                    if let app = indexed[directory.lastPathComponent] { app.appBundleFingerprint = fingerprint }
+                 }
+-            }
+-
+-            if didMutate {
+-                try? context.save()
++                if context.hasChanges { try context.save() }
++            } catch {
++                context.rollback()
++                throw error
+             }
+         }
+     }
+ 
+-    func migrateLegacyCachedSigningCertificates() async {
+-        let context = DatabaseManager.shared.viewContext
+-        await context.perform {
+-            let fetchRequest: NSFetchRequest<InstalledApp> = InstalledApp.fetchRequest()
+-            guard let installedApps = try? context.fetch(fetchRequest) else { return }
+-            let fileManager = FileManager.default
+-            let appsDir = InstalledApp.appsDirectoryURL
+-
+-            for app in installedApps {
+-                guard app.bundleIdentifier != app.resignedBundleIdentifier else { continue }
+-
+-                let legacyCertURL = appsDir.appendingPathComponent(app.bundleIdentifier).appendingPathComponent("signing_certificate.der")
+-                let targetCertURL = app.signingCertificateURL
+-
+-                guard fileManager.fileExists(atPath: legacyCertURL.path) else { continue }
+-
+-                do {
+-                    if !fileManager.fileExists(atPath: targetCertURL.path) {
+-                        let targetDir = targetCertURL.deletingLastPathComponent()
+-                        try fileManager.createDirectory(at: targetDir, withIntermediateDirectories: true, attributes: nil)
+-                        try fileManager.moveItem(at: legacyCertURL, to: targetCertURL)
++    private func migrateLegacyCachedSigningCertificates() async throws {
++        let context = DatabaseManager.shared.persistentContainer.newBackgroundContext()
++        try await context.perform {
++            do {
++                let apps = try context.fetch(NSFetchRequest<InstalledApp>(entityName: "InstalledApp"))
++                for app in apps where app.bundleIdentifier != app.resignedBundleIdentifier {
++                    let source = InstalledApp.appsDirectoryURL.appendingPathComponent(app.bundleIdentifier)
++                        .appendingPathComponent("signing_certificate.der")
++                    guard FileManager.default.fileExists(atPath: source.path) else { continue }
++                    guard let original = ALTX509Certificate(data: try Data(contentsOf: source)) else {
++                        throw AutomationUpgradeStorageError.certificateInvalid
++                    }
++                    try AutomationUpgradeStorage.verifiedCopy(source: source, destination: app.signingCertificateURL)
++                    guard let copied = ALTX509Certificate(data: try Data(contentsOf: app.signingCertificateURL)),
++                          copied.serialNumber == original.serialNumber else {
++                        throw AutomationUpgradeStorageError.certificateInvalid
++                    }
++                    if let serial = app.certificateSerialNumber, !serial.isEmpty {
++                        guard serial.lowercased() == copied.serialNumber.lowercased() else {
++                            throw AutomationUpgradeStorageError.certificateSerialConflict
++                        }
+                     } else {
+-                        try fileManager.removeItem(at: legacyCertURL)
++                        app.certificateSerialNumber = copied.serialNumber
+                     }
+-                    debugLog("[MaintenanceManager] Migrated signing cert for '\(app.bundleIdentifier)' -> '\(app.resignedBundleIdentifier)'")
+-                } catch {
+-                    debugLog("[MaintenanceManager] Failed to migrate signing cert from '\(legacyCertURL.path)': \(error)")
+                 }
++                if context.hasChanges { try context.save() }
++            } catch {
++                context.rollback()
++                throw error
+             }
+         }
+     }
