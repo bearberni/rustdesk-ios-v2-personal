@@ -765,13 +765,13 @@ index 0000000..6921a1e
 +}
 diff --git a/AutomationTests/UpgradeStorageTests.swift b/AutomationTests/UpgradeStorageTests.swift
 new file mode 100644
-index 0000000..1c52085
+index 0000000..f2ef630
 --- /dev/null
 +++ b/AutomationTests/UpgradeStorageTests.swift
 @@ -0,0 +1,207 @@
 +import XCTest
 +import Foundation
-+import SQLite3
++import AutomationSQLite
 +@testable import SideStoreAutomationPolicy
 +
 +final class UpgradeStorageTests: XCTestCase {
@@ -978,7 +978,7 @@ index 0000000..1c52085
 +}
 diff --git a/Package.swift b/Package.swift
 new file mode 100644
-index 0000000..8922e42
+index 0000000..bdc5106
 --- /dev/null
 +++ b/Package.swift
 @@ -0,0 +1,17 @@
@@ -992,20 +992,20 @@ index 0000000..8922e42
 +    platforms: [.macOS(.v13)],
 +    products: [.library(name: "SideStoreAutomationPolicy", targets: ["SideStoreAutomationPolicy"])],
 +    targets: [
-+        .systemLibrary(name: "SQLite3", path: "SQLite3", pkgConfig: "sqlite3"),
-+        .target(name: "SideStoreAutomationPolicy", dependencies: ["SQLite3"], path: "SideStore/Core/Automation",
++        .systemLibrary(name: "AutomationSQLite", path: "SQLite3", pkgConfig: "sqlite3"),
++        .target(name: "SideStoreAutomationPolicy", dependencies: ["AutomationSQLite"], path: "SideStore/Core/Automation",
 +                exclude: ["AutomationRefreshIntent.swift", "AutomationRefreshCoordinator.swift", "AutomationProfileEvidence.swift"],
 +                sources: ["AutomationRefreshPolicy.swift", "AutomationPortConfiguration.swift", "AutomationUpgradeStorage.swift"]),
-+        .testTarget(name: "SideStoreAutomationPolicyTests", dependencies: ["SideStoreAutomationPolicy", "SQLite3"], path: "AutomationTests")
++        .testTarget(name: "SideStoreAutomationPolicyTests", dependencies: ["SideStoreAutomationPolicy", "AutomationSQLite"], path: "AutomationTests")
 +    ]
 +)
 diff --git a/SQLite3/module.modulemap b/SQLite3/module.modulemap
 new file mode 100644
-index 0000000..128774c
+index 0000000..5974816
 --- /dev/null
 +++ b/SQLite3/module.modulemap
 @@ -0,0 +1,5 @@
-+module SQLite3 [system] {
++module AutomationSQLite [system] {
 +    header "shim.h"
 +    link "sqlite3"
 +    export *
@@ -2346,12 +2346,16 @@ index 0000000..6d2c57b
 +}
 diff --git a/SideStore/Core/Automation/AutomationUpgradeStorage.swift b/SideStore/Core/Automation/AutomationUpgradeStorage.swift
 new file mode 100644
-index 0000000..4287c44
+index 0000000..341f6fa
 --- /dev/null
 +++ b/SideStore/Core/Automation/AutomationUpgradeStorage.swift
-@@ -0,0 +1,259 @@
+@@ -0,0 +1,263 @@
 +import Foundation
++#if SWIFT_PACKAGE
++import AutomationSQLite
++#else
 +import SQLite3
++#endif
 +import CryptoKit
 +
 +// This helper never reads Keychain/pairing and never removes a legacy source.
