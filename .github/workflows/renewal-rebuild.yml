@@ -1,0 +1,115 @@
+name: Validate SideStore renewal rebuild
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [sidestore-renewal-rebuild]
+    paths: ['renewal-source.json']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sidestore-renewal-rebuild-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Restore verified readable source
+        shell: python3 {0}
+        env:
+          RENEWAL_SOURCE_SHA256: "abe63708fed195e62cd069377a7d2f7a292480f68982136d3f507720c2ef1a63"
+        run: |
+          import hashlib, json, os
+          from pathlib import Path, PurePosixPath
+          raw = Path("renewal-source.json").read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == os.environ["RENEWAL_SOURCE_SHA256"], "Source JSON changed"
+          spec = json.loads(raw)
+          assert spec["schemaVersion"] == 1 and 1 <= len(spec["files"]) <= 100
+          root = Path("renewal-build").resolve()
+          assert not root.exists(), "Restoration directory already exists"
+          names = set()
+          checked = []
+          for entry in spec["files"]:
+              name = entry["path"]
+              path = PurePosixPath(name)
+              assert name and "\\" not in name and not path.is_absolute() and ".." not in path.parts
+              assert str(path) == name and name not in names, "Noncanonical or duplicate path"
+              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/"))
+              target = root / name
+              assert target.resolve().is_relative_to(root)
+              data = entry["content"].encode("utf-8")
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"], "Source entry changed"
+              names.add(name)
+              checked.append((target, data))
+          manifest = next(data for target, data in checked if target == root / "manifest.json")
+          assert hashlib.sha256(manifest).hexdigest() == spec["sourceManifestSHA256"]
+          for target, data in checked:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+          print(f"Restored {len(checked)} verified text files")
+      - run: python3 renewal-build/ci.py verify
+      - run: swift test --package-path renewal-build/payload/Dependencies/RenewalCore
+
+  ios:
+    needs: core
+    runs-on: xcode-27
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Restore verified readable source
+        shell: python3 {0}
+        env:
+          RENEWAL_SOURCE_SHA256: "abe63708fed195e62cd069377a7d2f7a292480f68982136d3f507720c2ef1a63"
+        run: |
+          import hashlib, json, os
+          from pathlib import Path, PurePosixPath
+          raw = Path("renewal-source.json").read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == os.environ["RENEWAL_SOURCE_SHA256"], "Source JSON changed"
+          spec = json.loads(raw)
+          assert spec["schemaVersion"] == 1 and 1 <= len(spec["files"]) <= 100
+          root = Path("renewal-build").resolve()
+          assert not root.exists(), "Restoration directory already exists"
+          names = set()
+          checked = []
+          for entry in spec["files"]:
+              name = entry["path"]
+              path = PurePosixPath(name)
+              assert name and "\\" not in name and not path.is_absolute() and ".." not in path.parts
+              assert str(path) == name and name not in names, "Noncanonical or duplicate path"
+              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/"))
+              target = root / name
+              assert target.resolve().is_relative_to(root)
+              data = entry["content"].encode("utf-8")
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"], "Source entry changed"
+              names.add(name)
+              checked.append((target, data))
+          manifest = next(data for target, data in checked if target == root / "manifest.json")
+          assert hashlib.sha256(manifest).hexdigest() == spec["sourceManifestSHA256"]
+          for target, data in checked:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+          print(f"Restored {len(checked)} verified text files")
+      - run: xcodebuild -version
+      - run: swift test --package-path renewal-build/payload/Dependencies/RenewalCore
+      - run: python3 renewal-build/ci.py preservation
+      - run: python3 renewal-build/ci.py assemble
+      - run: brew install ldid
+      - run: python3 renewal-build/ci.py build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sidestore-renewal-native-validation
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 3
