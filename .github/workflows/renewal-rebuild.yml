@@ -24,7 +24,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "abe63708fed195e62cd069377a7d2f7a292480f68982136d3f507720c2ef1a63"
+          RENEWAL_SOURCE_SHA256: "c8d7a6ee8513fcefbf73210a378c51c997830ba4478c97e40eccd20aaedcaec3"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -71,7 +71,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "abe63708fed195e62cd069377a7d2f7a292480f68982136d3f507720c2ef1a63"
+          RENEWAL_SOURCE_SHA256: "c8d7a6ee8513fcefbf73210a378c51c997830ba4478c97e40eccd20aaedcaec3"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
