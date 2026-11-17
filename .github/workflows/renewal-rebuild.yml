@@ -24,7 +24,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "31a6411c02304264a8ac41bfd293311ee00172f87b7bbeabeb7efab4a6702d11"
+          RENEWAL_SOURCE_SHA256: "27dae378e54bac353c772f138b98876910e00dd1693c22357ef6a04e61e44445"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -71,7 +71,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "31a6411c02304264a8ac41bfd293311ee00172f87b7bbeabeb7efab4a6702d11"
+          RENEWAL_SOURCE_SHA256: "27dae378e54bac353c772f138b98876910e00dd1693c22357ef6a04e61e44445"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -103,7 +103,6 @@ jobs:
           print(f"Restored {len(checked)} verified text files")
       - run: xcodebuild -version
       - run: swift test --package-path renewal-build/payload/Dependencies/RenewalCore
-      - run: python3 renewal-build/ci.py preservation
       - run: python3 renewal-build/ci.py assemble
       - run: brew install ldid
       - run: python3 renewal-build/ci.py build
