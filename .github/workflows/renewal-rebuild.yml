@@ -24,7 +24,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "62a22b5e028526c36220f42323e4117f1d7f656305919dc2ce8f2d42877bbb58"
+          RENEWAL_SOURCE_SHA256: "dbf29901e2c8e7f774982cfb536739dc558f5bd8671445f6fd5550addc5ab87d"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -85,7 +85,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "62a22b5e028526c36220f42323e4117f1d7f656305919dc2ce8f2d42877bbb58"
+          RENEWAL_SOURCE_SHA256: "dbf29901e2c8e7f774982cfb536739dc558f5bd8671445f6fd5550addc5ab87d"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -121,13 +121,16 @@ jobs:
       - run: python3 renewal-build/ci-tools/integration/prepare_current.py --source native-source --core native-source/Dependencies/RenewalCore --output integration-tests
       - run: bash integration-tests/run-portable.sh
       - run: brew install ldid
+        if: "!contains(github.event.head_commit.message, '[simulator-only]')"
       - run: python3 renewal-build/ci.py build
+        if: "!contains(github.event.head_commit.message, '[simulator-only]')"
       - run: python3 renewal-build/ci-tools/shortcut/check_appintents_metadata.py artifacts/SideStore-OneClick-Renewal-0707-unsigned.ipa --output artifacts/appintents-contract.json
+        if: "!contains(github.event.head_commit.message, '[simulator-only]')"
       - run: python3 renewal-build/ci-tools/simulator/run_simulator_smoke.py --source native-source --output-dir artifacts/simulator-smoke
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
-          name: sidestore-renewal-workflow-0707
+          name: ${{ contains(github.event.head_commit.message, '[simulator-only]') && 'sidestore-simulator-0707' || 'sidestore-renewal-workflow-0707' }}
           path: |
             artifacts/
             integration-tests/test.log
@@ -136,6 +139,7 @@ jobs:
           retention-days: 3
 
   shortcut:
+    if: "!contains(github.event.head_commit.message, '[simulator-only]')"
     runs-on: xcode-27
     timeout-minutes: 20
     env:
@@ -147,7 +151,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "62a22b5e028526c36220f42323e4117f1d7f656305919dc2ce8f2d42877bbb58"
+          RENEWAL_SOURCE_SHA256: "dbf29901e2c8e7f774982cfb536739dc558f5bd8671445f6fd5550addc5ab87d"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
