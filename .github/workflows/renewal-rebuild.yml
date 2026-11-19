@@ -24,7 +24,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "02aead9f08db5c2ca2cc08bf6981a2c6e466d233e6bb9e9c29c09c09a9bde5cc"
+          RENEWAL_SOURCE_SHA256: "3e934ee61ac16e8ae64a36bd9c3a0ce8d7d07e183fad3e0a6a79b8ae5ff09514"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -41,7 +41,7 @@ jobs:
               path = PurePosixPath(name)
               assert name and "\\" not in name and not path.is_absolute() and ".." not in path.parts
               assert str(path) == name and name not in names, "Noncanonical or duplicate path"
-              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/"))
+              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/", "ci-tools/"))
               target = root / name
               assert target.resolve().is_relative_to(root)
               data = entry["content"].encode("utf-8")
@@ -56,6 +56,20 @@ jobs:
           print(f"Restored {len(checked)} verified text files")
       - run: python3 renewal-build/ci.py verify
       - run: swift test --package-path renewal-build/payload/Dependencies/RenewalCore
+      - run: python3 renewal-build/ci.py assemble
+      - run: python3 renewal-build/ci-tools/integration/prepare_current.py --source native-source --core native-source/Dependencies/RenewalCore --output integration-tests
+      - run: bash integration-tests/run-portable.sh
+      - run: python3 renewal-build/ci-tools/shortcut/run_checks.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: renewal-linux-integration
+          path: |
+            integration-tests/test.log
+            integration-tests/source-provenance.json
+            renewal-build/ci-tools/shortcut/offline-test-result.json
+          if-no-files-found: error
+          retention-days: 3
 
   ios:
     needs: core
@@ -71,7 +85,7 @@ jobs:
       - name: Restore verified readable source
         shell: python3 {0}
         env:
-          RENEWAL_SOURCE_SHA256: "02aead9f08db5c2ca2cc08bf6981a2c6e466d233e6bb9e9c29c09c09a9bde5cc"
+          RENEWAL_SOURCE_SHA256: "3e934ee61ac16e8ae64a36bd9c3a0ce8d7d07e183fad3e0a6a79b8ae5ff09514"
         run: |
           import hashlib, json, os
           from pathlib import Path, PurePosixPath
@@ -88,7 +102,7 @@ jobs:
               path = PurePosixPath(name)
               assert name and "\\" not in name and not path.is_absolute() and ".." not in path.parts
               assert str(path) == name and name not in names, "Noncanonical or duplicate path"
-              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/"))
+              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/", "ci-tools/"))
               target = root / name
               assert target.resolve().is_relative_to(root)
               data = entry["content"].encode("utf-8")
@@ -104,11 +118,82 @@ jobs:
       - run: xcodebuild -version
       - run: swift test --package-path renewal-build/payload/Dependencies/RenewalCore
       - run: python3 renewal-build/ci.py assemble
+      - run: python3 renewal-build/ci-tools/integration/prepare_current.py --source native-source --core native-source/Dependencies/RenewalCore --output integration-tests
+      - run: bash integration-tests/run-portable.sh
       - run: brew install ldid
       - run: python3 renewal-build/ci.py build
+      - run: python3 renewal-build/ci-tools/shortcut/check_appintents_metadata.py artifacts/SideStore-OneClick-Renewal-0706-unsigned.ipa --output artifacts/appintents-contract.json
+      - run: python3 renewal-build/ci-tools/simulator/run_simulator_smoke.py --source native-source --output-dir artifacts/simulator-smoke
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
         with:
-          name: sidestore-renewal-native-validation
-          path: artifacts/
+          name: sidestore-renewal-workflow-0706
+          path: |
+            artifacts/
+            integration-tests/test.log
+            integration-tests/source-provenance.json
+          if-no-files-found: error
+          retention-days: 3
+
+  shortcut:
+    runs-on: xcode-27
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Restore verified readable source
+        shell: python3 {0}
+        env:
+          RENEWAL_SOURCE_SHA256: "3e934ee61ac16e8ae64a36bd9c3a0ce8d7d07e183fad3e0a6a79b8ae5ff09514"
+        run: |
+          import hashlib, json, os
+          from pathlib import Path, PurePosixPath
+          raw = Path("renewal-source.json").read_bytes()
+          assert hashlib.sha256(raw).hexdigest() == os.environ["RENEWAL_SOURCE_SHA256"], "Source JSON changed"
+          spec = json.loads(raw)
+          assert spec["schemaVersion"] == 1 and 1 <= len(spec["files"]) <= 100
+          root = Path("renewal-build").resolve()
+          assert not root.exists(), "Restoration directory already exists"
+          names = set()
+          checked = []
+          for entry in spec["files"]:
+              name = entry["path"]
+              path = PurePosixPath(name)
+              assert name and "\\" not in name and not path.is_absolute() and ".." not in path.parts
+              assert str(path) == name and name not in names, "Noncanonical or duplicate path"
+              assert name in {"ci.py", "manifest.json", "renewal-rebuild.yml"} or name.startswith(("payload/", "preservation-check/", "ci-tools/"))
+              target = root / name
+              assert target.resolve().is_relative_to(root)
+              data = entry["content"].encode("utf-8")
+              assert hashlib.sha256(data).hexdigest() == entry["sha256"], "Source entry changed"
+              names.add(name)
+              checked.append((target, data))
+          manifest = next(data for target, data in checked if target == root / "manifest.json")
+          assert hashlib.sha256(manifest).hexdigest() == spec["sourceManifestSHA256"]
+          for target, data in checked:
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(data)
+          print(f"Restored {len(checked)} verified text files")
+      - run: shortcuts list >/dev/null
+        timeout-minutes: 2
+        continue-on-error: true
+      - run: python3 renewal-build/ci-tools/apple/probe_apple_vpn_metadata.py --output-dir artifacts/apple-vpn-metadata
+      - run: python3 renewal-build/ci-tools/shortcut/run_checks.py --apple-catalog artifacts/apple-vpn-metadata/apple-vpn-metadata.json
+      - run: python3 renewal-build/ci-tools/shortcut/builder.py --bundle-id com.SideStore.SideStore.85TZVFJX88 --team-id 85TZVFJX88 --output-dir artifacts/personal-shortcut
+      - run: python3 renewal-build/ci-tools/shortcut/validate.py artifacts/personal-shortcut/SideStore-Renewal-unsigned.shortcut
+      - run: shortcuts sign --mode anyone --input artifacts/personal-shortcut/SideStore-Renewal-unsigned.shortcut --output artifacts/SideStore-OneClick-Renewal-0706.shortcut
+        timeout-minutes: 3
+      - run: python3 renewal-build/ci-tools/shortcut/check_apple_catalog.py artifacts/apple-vpn-metadata/apple-vpn-metadata.json --require-verified
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: sidestore-renewal-shortcut-0706
+          path: |
+            artifacts/
+            renewal-build/ci-tools/shortcut/offline-test-result.json
+            renewal-build/ci-tools/shortcut/offline-tests.log
           if-no-files-found: error
           retention-days: 3
